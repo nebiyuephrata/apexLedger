@@ -20,12 +20,12 @@ from datagen.schema_validator import SchemaValidator
 fake = Faker()
 
 SEED_SCENARIOS = [
-    ("SUBMITTED",             6),   # Docs requested, nothing uploaded yet
-    ("DOCUMENTS_UPLOADED",    5),   # Docs uploaded, agent not run yet
+    ("SUBMITTED",             7),   # Docs requested, nothing uploaded yet
+    ("DOCUMENTS_UPLOADED",    6),   # Docs uploaded, agent not run yet
     ("DOCUMENTS_PROCESSED",   4),   # Week 3 pipeline done, credit not started
     ("CREDIT_COMPLETE",       3),   # Credit done, fraud not started
     ("FRAUD_COMPLETE",        2),   # Fraud done, compliance not started
-    ("APPROVED",              5),   # Full happy path
+    ("APPROVED",             12),   # Full happy path
     ("DECLINED",              2),   # Agent-driven decline
     ("DECLINED_COMPLIANCE",   1),   # REG-003 (Montana) hard block
     ("REFERRED",              1),   # Low-confidence orchestrator → human review
@@ -261,6 +261,8 @@ def main():
         print(f"  [OK] {count} files in {args.docs_dir}/")
 
     # ── Step 3: Simulate Events ────────────────────────────────────────────────
+    # Reset RNG state so event counts are deterministic regardless of doc generation.
+    random.seed(args.random_seed + 1); Faker.seed(args.random_seed + 1)
     print(f"\n[3/5] Simulating seed event history (all 5 agent pipelines)...")
     all_events = []; validator = SchemaValidator()
     mt_company = next((c for c in companies if c.jurisdiction=="MT"), companies[-1])
