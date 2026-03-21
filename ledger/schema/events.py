@@ -306,6 +306,13 @@ class ApplicationDeclined(BaseEvent):
     adverse_action_codes: list[str] = Field(default_factory=list)
     declined_at: datetime
 
+class ApplicationWithdrawn(BaseEvent):
+    event_type: str = "ApplicationWithdrawn"
+    application_id: str
+    withdrawn_by: str
+    reason: str | None = None
+    withdrawn_at: datetime
+
 
 # ─── AGGREGATE 2: DOCUMENT PACKAGE ───────────────────────────────────────────
 # stream: "docpkg-{application_id}"
@@ -407,6 +414,15 @@ class AgentSessionStarted(BaseEvent):
     context_source: str
     context_token_count: int
     started_at: datetime
+
+class AgentContextLoaded(BaseEvent):
+    event_type: str = "AgentContextLoaded"
+    session_id: str
+    agent_type: AgentType
+    application_id: str
+    context_source: str
+    context_token_count: int
+    loaded_at: datetime
 
 class AgentInputValidated(BaseEvent):
     event_type: str = "AgentInputValidated"
@@ -547,6 +563,15 @@ class CreditAnalysisDeferred(BaseEvent):
     quality_issues: list[str]
     deferred_at: datetime
 
+class CreditAnalysisCorrected(BaseEvent):
+    event_type: str = "CreditAnalysisCorrected"
+    application_id: str
+    session_id: str
+    original_event_id: str
+    corrected_decision: CreditDecision
+    correction_reason: str
+    corrected_at: datetime
+
 
 # ─── AGGREGATE 5: COMPLIANCE RECORD ──────────────────────────────────────────
 # stream: "compliance-{application_id}"
@@ -669,6 +694,7 @@ EVENT_REGISTRY: dict[str, type[BaseEvent]] = {
     "HumanReviewCompleted": HumanReviewCompleted,
     "ApplicationApproved": ApplicationApproved,
     "ApplicationDeclined": ApplicationDeclined,
+    "ApplicationWithdrawn": ApplicationWithdrawn,
     # DocumentPackage
     "PackageCreated": PackageCreated,
     "DocumentAdded": DocumentAdded,
@@ -681,6 +707,7 @@ EVENT_REGISTRY: dict[str, type[BaseEvent]] = {
     "PackageReadyForAnalysis": PackageReadyForAnalysis,
     # AgentSession
     "AgentSessionStarted": AgentSessionStarted,
+    "AgentContextLoaded": AgentContextLoaded,
     "AgentInputValidated": AgentInputValidated,
     "AgentInputValidationFailed": AgentInputValidationFailed,
     "AgentNodeExecuted": AgentNodeExecuted,
@@ -695,6 +722,7 @@ EVENT_REGISTRY: dict[str, type[BaseEvent]] = {
     "ExtractedFactsConsumed": ExtractedFactsConsumed,
     "CreditAnalysisCompleted": CreditAnalysisCompleted,
     "CreditAnalysisDeferred": CreditAnalysisDeferred,
+    "CreditAnalysisCorrected": CreditAnalysisCorrected,
     # ComplianceRecord
     "ComplianceCheckInitiated": ComplianceCheckInitiated,
     "ComplianceRulePassed": ComplianceRulePassed,
