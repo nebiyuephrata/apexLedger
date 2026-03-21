@@ -192,15 +192,48 @@ class CreditAnalysisAgent(BaseApexAgent):
 
     async def _node_load_registry(self, state):
         t = time.time()
-        # TODO: profile = await self.registry.get_company(state["applicant_id"])
-        # TODO: hist = await self.registry.get_financial_history(state["applicant_id"], years=[2022,2023,2024])
-        # TODO: flags = await self.registry.get_compliance_flags(state["applicant_id"])
-        # TODO: loans = await self.registry.get_loan_relationships(state["applicant_id"])
+        profile = await self.registry.get_company(state["applicant_id"])
+        hist = await self.registry.get_financial_history(state["applicant_id"], years=[2022,2023,2024])
+        flags = await self.registry.get_compliance_flags(state["applicant_id"])
+        loans = await self.registry.get_loan_relationships(state["applicant_id"])
         ms = int((time.time()-t)*1000)
-        await self._record_tool_call("query_applicant_registry", f"company_id={state['applicant_id']}", "3yr financials loaded", ms)
-        # TODO: await self._append_stream(f"credit-{state['application_id']}", HistoricalProfileConsumed(...).to_store_dict())
+        await self._record_tool_call(
+            "query_applicant_registry",
+            f"company_id={state['applicant_id']}",
+            f"financials={len(hist)} flags={len(flags)} loans={len(loans)}",
+            ms,
+        )
+        await self._append_stream(
+            f"credit-{state['application_id']}",
+            {
+                "event_type": "HistoricalProfileConsumed",
+                "event_version": 1,
+                "payload": {
+                    "application_id": state["application_id"],
+                    "session_id": self.session_id,
+                    "fiscal_years_loaded": [h.fiscal_year if hasattr(h, \"fiscal_year\") else h.get(\"fiscal_year\") for h in hist],
+                    "has_prior_loans": bool(loans),
+                    "has_defaults": any(
+                        (l.default_occurred if hasattr(l, \"default_occurred\") else l.get(\"default_occurred\"))
+                        for l in loans
+                    ),
+                    "revenue_trajectory": (profile.trajectory if hasattr(profile, \"trajectory\") else (profile.get(\"trajectory\") if profile else \"UNKNOWN\")),
+                    "data_hash": self._sha(hist),
+                    "consumed_at": datetime.now().isoformat(),
+                },
+            },
+        )
         await self._record_node_execution("load_applicant_registry",["applicant_id"],["historical_financials","compliance_flags","loan_history"],ms)
-        return {**state,"company_profile":{},"historical_financials":[],"compliance_flags":[],"loan_history":[]}
+        def _to_dict(x):
+            if x is None: return None
+            return x.__dict__ if hasattr(x, "__dict__") else dict(x)
+        return {
+            **state,
+            "company_profile": _to_dict(profile) or {},
+            "historical_financials": [_to_dict(h) for h in hist],
+            "compliance_flags": [_to_dict(f) for f in flags],
+            "loan_history": [_to_dict(l) for l in loans],
+        }
 
     async def _node_load_facts(self, state):
         t = time.time()
