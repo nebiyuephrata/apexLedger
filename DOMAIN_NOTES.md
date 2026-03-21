@@ -1,76 +1,55 @@
-# Domain Notes — The Ledger (Phase 0)
+# Domain Notes — The Ledger
 
 ## Purpose
-The Ledger is an event-sourced system for loan decisioning. Every business fact is captured as an immutable event in a PostgreSQL append-only store. All downstream views (projections) are derived asynchronously from the event log.
+The Ledger is an event-sourced system of record for multi-agent loan decisioning. All business facts are immutable events stored in PostgreSQL. Aggregate state is rebuilt by replaying events, and read-optimized projections provide fast query views.
 
-## Event Sourcing vs Event-Driven Architecture
-- Event Sourcing (ES) is the **source of truth**: state is reconstructed by replaying events. The `events` table is authoritative.
-- Event-Driven Architecture (EDA) is **integration style**: events are published to trigger downstream actions, but state may still live in mutable tables.
-- This system is ES-first. EDA is optional (e.g., outbox) but does not replace the event log.
-- Redesigning LangChain traces as ES improves reconstruction: agent traces become deterministic, replayable streams instead of ephemeral logs, enabling crash recovery and auditability.
+## Event Sourcing vs EDA
+Event-Driven Architecture (EDA) traces are optional, lossy, and not authoritative. Event Sourcing (ES) makes events the permanent source of truth. In The Ledger, all decisions become immutable events in `events`, aggregates rebuild state from streams, and projections provide queryable views. This enables deterministic replay, auditability, and time-travel reconstruction.
 
-## Aggregate Boundaries and Rationale
-Aggregates exist to prevent inconsistent writes and to localize concurrency.
+## Aggregate Boundaries
+Chosen boundaries in this implementation:
+- LoanApplication (`loan-{application_id}`)
+- DocumentPackage (`docpkg-{application_id}`)
+- AgentSession (`agent-{agent_type}-{session_id}`)
+- ComplianceRecord (`compliance-{application_id}`)
+- CreditRecord (`credit-{application_id}`)
+- FraudScreening (`fraud-{application_id}`)
+- AuditLedger (`audit-{entity_id}`)
 
-- **LoanApplication** (`loan-{application_id}`)
-  Owns the application lifecycle state machine and the final decision events.
+### Why ComplianceRecord Is Separate
+Merging compliance into LoanApplication would create write contention: each compliance rule write would lock the loan stream and collide with other agents. A dedicated ComplianceRecord isolates compliance spikes and prevents compliance retries from blocking decisions.
 
-- **DocumentPackage** (`docpkg-{application_id}`)
-  Owns document ingestion and extraction events. Separating this reduces contention during document processing.
+## OCC Concurrency Sequence (expected_version=3)
+1. Two agents load the stream at version 3.
+2. Agent A acquires the row lock in `event_streams`, passes the OCC check, appends at position 4, and commits.
+3. Agent B acquires the lock later, sees current_version=4, and raises `OptimisticConcurrencyError(stream_id, expected=3, actual=4)`.
+4. Agent B reloads and decides whether to retry.
 
-- **AgentSession** (`agent-{agent_type}-{session_id}`)
-  Owns agent execution trace events. This stream is the Gas Town memory anchor.
+## Projection Lag Contract
+Projections can lag writes by ~200ms. The UI should display a lag indicator based on `last_event_at`. For strict actions, the system can re-read from the event stream or wait until the projection checkpoint catches up.
 
-- **CreditRecord** (`credit-{application_id}`)
-  Owns credit analysis events and historical profile consumption.
+## Upcasting Strategy (Current Implementation)
+Upcasters run on read, never on write, and never fabricate data. The current registry applies:
+- `CreditAnalysisCompleted` v1 → v2: adds `regulatory_basis=[]` if missing
+- `DecisionGenerated` v1 → v2: adds `model_versions={}` if missing
 
-- **FraudScreening** (`fraud-{application_id}`)
-  Owns fraud assessment events and anomalies.
+Example pattern:
+```python
+if et == "CreditAnalysisCompleted" and ver < 2:
+    p.setdefault("regulatory_basis", [])
+if et == "DecisionGenerated" and ver < 2:
+    p.setdefault("model_versions", {})
+```
 
-- **ComplianceRecord** (`compliance-{application_id}`)
-  Owns deterministic regulatory checks and overall compliance verdict.
+## Parallel Projection Scaling
+To scale projections, use advisory locks or a lease table. Each worker claims a projection or event-range lease. If a worker dies, the lease expires and another worker resumes from the last checkpoint. This prevents double-processing and corrupted aggregates.
 
-- **AuditLedger** (`audit-{entity_id}`)
-  Owns integrity checks and tamper-evidence chains.
+## Gas Town Pattern
+Every agent session starts with `AgentSessionStarted` and optionally `AgentContextLoaded`. Session streams are replayable via `reconstruct_agent_context` to resume after crashes.
 
-## Why ComplianceRecord Is Separate from LoanApplication
-Compliance checks are deterministic, read-heavy, and can be run independently of other agents. If Compliance events were written directly into the LoanApplication aggregate, any compliance re-check would contend on the loan stream, increasing OCC collisions when other agents append concurrently. A dedicated ComplianceRecord aggregate isolates those writes, allowing compliance to execute and complete without blocking credit/fraud agents or the decision orchestrator. The LoanApplication aggregate consumes the final ComplianceCheckCompleted event as an input to decisioning, preserving consistency without hot-spotting the loan stream.
+## Read vs Write
+- Write side: command handlers append immutable events.
+- Read side: projection daemon consumes the global stream and builds query tables.
 
-## Concurrency: Two Agents Append With expected_version=3
-1. Both agents load stream version 3.
-2. Agent A acquires the `event_streams` row lock first, passes OCC, appends events at position 4, updates current_version to 4, commits.
-3. Agent B then acquires the lock, sees current_version=4, and raises OptimisticConcurrencyError because expected_version=3.
-4. Result: exactly one success, no duplicate event at position 4.
-
-## Projection Lag (200ms Read After Write)
-Use read-your-writes via the write model when strict freshness is required:
-- The write API returns the appended event or the new version/limit.
-- The UI can render that authoritative response immediately while projections catch up.
-- For strict read models, support an `as_of_position` query to replay to the latest known position.
-
-## Upcasting Strategy (CreditDecisionMade)
-No `CreditDecisionMade` event exists in this codebase; the closest analog is `DecisionGenerated` or `CreditAnalysisCompleted`.
-If a legacy `CreditDecisionMade` is introduced, an upcaster should:
-- Map fields into the current event type payload.
-- Fill missing fields with safe defaults (e.g., `model_versions={}`).
-- Keep an `original_event_type` marker in metadata for audit.
-
-## Marten Parallel Projection Analogy (Python)
-Emulate Marten-style parallel projection execution by:
-- Partitioning by stream_id hash or aggregate type.
-- Running multiple async workers, each reading from `load_all()` and committing checkpoints.
-- Using `projection_checkpoints` for idempotent resume and at-least-once processing.
-
-## Gas Town Pattern (AgentSession Aggregate)
-- Every agent session **must** start with `AgentSessionStarted`.
-- Session streams are replayable to reconstruct agent context after a crash.
-- The base agent enforces this ordering rule at append time.
-
-## Read vs Write Side
-- **Write side**: commands append events to the event store.
-- **Read side**: projections are built asynchronously by a projection daemon using global ordering.
-- This separation keeps API writes low-latency and allows projection replays for temporal queries.
-
-## Operational Constraints
-- The `applicant_registry` schema is read-only from the runtime system.
-- All application-specific state changes must be captured as events in the ledger.
+## Data Boundary
+`applicant_registry` is read-only. All application-specific facts live in ledger streams.
