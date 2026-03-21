@@ -58,6 +58,8 @@ class AgentSessionAggregate:
         self.agent_type = p.get("agent_type")
         self.application_id = p.get("application_id")
         self.model_version = p.get("model_version")
+        if p.get("context_source") is not None:
+            self.context_loaded = True
 
     def _on_AgentContextLoaded(self, p: dict) -> None:
         self.context_loaded = True
