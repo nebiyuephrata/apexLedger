@@ -290,6 +290,50 @@ class EventStore:
             return {**dict(row), "payload": dict(row["payload"]),
                                   "metadata": dict(row["metadata"])}
 
+    # ─────────────────────────────────────────────────────────────────────
+    # OUTBOX HELPERS
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def load_outbox(
+        self, batch_size: int = 100, destination: str | None = None
+    ) -> list[dict]:
+        """
+        Load unpublished outbox rows in FIFO order.
+        Optionally filter by destination.
+        """
+        async with self._pool.acquire() as conn:
+            if destination:
+                rows = await conn.fetch(
+                    "SELECT * FROM outbox WHERE published_at IS NULL AND destination=$1"
+                    " ORDER BY created_at ASC LIMIT $2",
+                    destination, batch_size,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM outbox WHERE published_at IS NULL"
+                    " ORDER BY created_at ASC LIMIT $1",
+                    batch_size,
+                )
+            return [{**dict(r), "payload": dict(r["payload"])} for r in rows]
+
+    async def mark_outbox_published(self, outbox_ids: list[UUID]) -> None:
+        """Mark a batch of outbox rows as published."""
+        if not outbox_ids: return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE outbox SET published_at = NOW() WHERE id = ANY($1::uuid[])",
+                outbox_ids,
+            )
+
+    async def increment_outbox_attempts(self, outbox_ids: list[UUID]) -> None:
+        """Increment attempts counter for a batch of outbox rows."""
+        if not outbox_ids: return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1 WHERE id = ANY($1::uuid[])",
+                outbox_ids,
+            )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UPCASTER REGISTRY — Phase 4
