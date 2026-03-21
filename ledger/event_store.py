@@ -63,6 +63,25 @@ class EventStore:
             )
             return row["current_version"] if row else -1
 
+    async def get_stream_metadata(self, stream_id: str) -> dict | None:
+        """Return event_streams row for a stream, or None if missing."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT stream_id, aggregate_type, current_version, created_at, archived_at, metadata "
+                "FROM event_streams WHERE stream_id=$1",
+                stream_id,
+            )
+            if not row: return None
+            return {**dict(row), "metadata": dict(row["metadata"])}
+
+    async def archive_stream(self, stream_id: str) -> None:
+        """Mark a stream as archived."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE event_streams SET archived_at = NOW() WHERE stream_id=$1",
+                stream_id,
+            )
+
     async def append(
         self,
         stream_id: str,
