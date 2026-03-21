@@ -112,16 +112,23 @@ async def handle_submit_application(store, command: Any) -> list[dict]:
     ).to_store_dict()
 
     # 4) Append atomically per stream with expected_version
+    correlation_id = _get(command, "correlation_id")
+    causation_id = _get(command, "causation_id")
+    meta = {"correlation_id": correlation_id} if correlation_id else None
     await store.append(
         stream_id=f"loan-{app_id}",
         events=[submit_event, doc_req_event],
         expected_version=app.version,
+        causation_id=causation_id,
+        metadata=meta,
     )
     docpkg_version = await store.stream_version(f"docpkg-{app_id}")
     await store.append(
         stream_id=f"docpkg-{app_id}",
         events=[package_event],
         expected_version=docpkg_version,
+        causation_id=causation_id,
+        metadata=meta,
     )
 
     return [submit_event, doc_req_event, package_event]
@@ -146,6 +153,8 @@ async def handle_credit_analysis_completed(store, command: Any) -> list[dict]:
     # 2) Validate business rules
     if not session.started:
         raise DomainError("Agent session is missing AgentSessionStarted anchor")
+    session.require_context_loaded()
+    session.require_model_version(_get(command, "model_version"))
     if session.application_id and session.application_id != app_id:
         raise DomainError("Agent session application_id mismatch")
 
@@ -202,17 +211,22 @@ async def handle_credit_analysis_completed(store, command: Any) -> list[dict]:
 
     # 4) Append with OCC
     credit_version = await store.stream_version(credit_stream)
+    correlation_id = _get(command, "correlation_id")
+    causation_id = _get(command, "causation_id", session_id)
+    meta = {"correlation_id": correlation_id} if correlation_id else None
     await store.append(
         stream_id=credit_stream,
         events=[decision_event],
         expected_version=credit_version,
-        causation_id=session_id,
+        causation_id=causation_id,
+        metadata=meta,
     )
     await store.append(
         stream_id=f"loan-{app_id}",
         events=[fraud_trigger],
         expected_version=app.version,
-        causation_id=session_id,
+        causation_id=causation_id,
+        metadata=meta,
     )
 
     return [decision_event, fraud_trigger]
@@ -244,6 +258,8 @@ async def handle_decision_generated(store, command: Any) -> list[dict]:
     orch_session = await AgentSessionAggregate.load(store, orch_stream)
     if not orch_session.started:
         raise DomainError("Orchestrator session missing AgentSessionStarted anchor")
+    orch_session.require_context_loaded()
+    orch_session.require_model_version(_get(command, "model_version"))
 
     # Confidence floor enforcement
     if confidence < 0.60:
@@ -296,11 +312,15 @@ async def handle_decision_generated(store, command: Any) -> list[dict]:
         generated_at=_get(command, "generated_at", datetime.now()),
     ).to_store_dict()
 
+    correlation_id = _get(command, "correlation_id")
+    causation_id = _get(command, "causation_id", orchestrator_session_id)
+    meta = {"correlation_id": correlation_id} if correlation_id else None
     await store.append(
         stream_id=f"loan-{app_id}",
         events=[event],
         expected_version=app.version,
-        causation_id=_get(command, "orchestrator_session_id"),
+        causation_id=causation_id,
+        metadata=meta,
     )
     return [event]
 
@@ -340,9 +360,14 @@ async def handle_application_approved(store, command: Any) -> list[dict]:
         approved_at=_get(command, "approved_at", datetime.now()),
     ).to_store_dict()
 
+    correlation_id = _get(command, "correlation_id")
+    causation_id = _get(command, "causation_id")
+    meta = {"correlation_id": correlation_id} if correlation_id else None
     await store.append(
         stream_id=f"loan-{app_id}",
         events=[event],
         expected_version=app.version,
+        causation_id=causation_id,
+        metadata=meta,
     )
     return [event]
