@@ -49,7 +49,16 @@ class ApplicantRegistryClient:
         TODO: implement
         SELECT * FROM applicant_registry.companies WHERE company_id = $1
         """
-        raise NotImplementedError
+        row = await self._pool.fetchrow(
+            "SELECT company_id, name, industry, naics, jurisdiction, legal_type, "
+            "founded_year, employee_count, risk_segment, trajectory, "
+            "submission_channel, ip_region "
+            "FROM applicant_registry.companies WHERE company_id = $1",
+            company_id,
+        )
+        if not row:
+            return None
+        return CompanyProfile(**dict(row))
 
     async def get_financial_history(self, company_id: str,
                                      years: list[int] | None = None) -> list[FinancialYear]:
@@ -59,7 +68,30 @@ class ApplicantRegistryClient:
         WHERE company_id = $1 [AND fiscal_year = ANY($2)]
         ORDER BY fiscal_year ASC
         """
-        raise NotImplementedError
+        if years:
+            rows = await self._pool.fetch(
+                "SELECT fiscal_year, total_revenue, gross_profit, operating_income, ebitda, net_income, "
+                "total_assets, total_liabilities, total_equity, long_term_debt, cash_and_equivalents, "
+                "current_assets, current_liabilities, accounts_receivable, inventory, "
+                "debt_to_equity, current_ratio, debt_to_ebitda, interest_coverage_ratio, "
+                "gross_margin, ebitda_margin, net_margin "
+                "FROM applicant_registry.financial_history "
+                "WHERE company_id = $1 AND fiscal_year = ANY($2) "
+                "ORDER BY fiscal_year ASC",
+                company_id, years,
+            )
+        else:
+            rows = await self._pool.fetch(
+                "SELECT fiscal_year, total_revenue, gross_profit, operating_income, ebitda, net_income, "
+                "total_assets, total_liabilities, total_equity, long_term_debt, cash_and_equivalents, "
+                "current_assets, current_liabilities, accounts_receivable, inventory, "
+                "debt_to_equity, current_ratio, debt_to_ebitda, interest_coverage_ratio, "
+                "gross_margin, ebitda_margin, net_margin "
+                "FROM applicant_registry.financial_history "
+                "WHERE company_id = $1 ORDER BY fiscal_year ASC",
+                company_id,
+            )
+        return [FinancialYear(**dict(r)) for r in rows]
 
     async def get_compliance_flags(self, company_id: str,
                                     active_only: bool = False) -> list[ComplianceFlag]:
@@ -68,11 +100,30 @@ class ApplicantRegistryClient:
         SELECT * FROM applicant_registry.compliance_flags
         WHERE company_id = $1 [AND is_active = TRUE]
         """
-        raise NotImplementedError
+        if active_only:
+            rows = await self._pool.fetch(
+                "SELECT flag_type, severity, is_active, added_date, note "
+                "FROM applicant_registry.compliance_flags "
+                "WHERE company_id = $1 AND is_active = TRUE",
+                company_id,
+            )
+        else:
+            rows = await self._pool.fetch(
+                "SELECT flag_type, severity, is_active, added_date, note "
+                "FROM applicant_registry.compliance_flags "
+                "WHERE company_id = $1",
+                company_id,
+            )
+        return [ComplianceFlag(**dict(r)) for r in rows]
 
     async def get_loan_relationships(self, company_id: str) -> list[dict]:
         """
         TODO: implement
         SELECT * FROM applicant_registry.loan_relationships WHERE company_id = $1
         """
-        raise NotImplementedError
+        rows = await self._pool.fetch(
+            "SELECT loan_amount, loan_year, was_repaid, default_occurred, note "
+            "FROM applicant_registry.loan_relationships WHERE company_id = $1",
+            company_id,
+        )
+        return [dict(r) for r in rows]
