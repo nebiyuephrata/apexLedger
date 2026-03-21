@@ -117,10 +117,11 @@ async def handle_submit_application(store, command: Any) -> list[dict]:
         events=[submit_event, doc_req_event],
         expected_version=app.version,
     )
+    docpkg_version = await store.stream_version(f"docpkg-{app_id}")
     await store.append(
         stream_id=f"docpkg-{app_id}",
         events=[package_event],
-        expected_version=-1,
+        expected_version=docpkg_version,
     )
 
     return [submit_event, doc_req_event, package_event]
