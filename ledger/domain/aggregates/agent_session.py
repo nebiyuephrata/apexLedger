@@ -19,6 +19,7 @@ class AgentSessionAggregate:
     application_id: str | None = None
     model_version: str | None = None
     started: bool = False
+    context_loaded: bool = False
     completed: bool = False
     failed: bool = False
     node_count: int = 0
@@ -58,6 +59,16 @@ class AgentSessionAggregate:
         self.application_id = p.get("application_id")
         self.model_version = p.get("model_version")
 
+    def _on_AgentContextLoaded(self, p: dict) -> None:
+        self.context_loaded = True
+        if not self.session_id:
+            self.session_id = p.get("session_id")
+        if not self.agent_type:
+            self.agent_type = p.get("agent_type")
+        if not self.application_id:
+            self.application_id = p.get("application_id")
+        self.model_version = p.get("model_version") or self.model_version
+
     def _on_AgentNodeExecuted(self, p: dict) -> None:
         self.node_count += 1
 
@@ -75,3 +86,23 @@ class AgentSessionAggregate:
             if out.get("application_id") == application_id:
                 return True
         return False
+
+    def require_context_loaded(self) -> None:
+        if not self.context_loaded:
+            raise DomainError(
+                "Agent context has not been loaded",
+                code="CONTEXT_NOT_LOADED",
+                context={"stream_id": self.stream_id},
+            )
+
+    def require_model_version(self, declared_model_version: str | None) -> None:
+        if self.model_version and declared_model_version and self.model_version != declared_model_version:
+            raise DomainError(
+                "Agent model version mismatch",
+                code="MODEL_VERSION_MISMATCH",
+                context={
+                    "stream_id": self.stream_id,
+                    "expected": self.model_version,
+                    "actual": declared_model_version,
+                },
+            )
