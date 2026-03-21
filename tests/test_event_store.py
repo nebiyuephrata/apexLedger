@@ -9,11 +9,11 @@ When all pass, your event store is correct.
 
 Run: pytest tests/test_event_store.py -v
 """
-import asyncio, pytest, sys
+import asyncio, os, pytest, sys
 from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent.parent))
 from ledger.event_store import EventStore, OptimisticConcurrencyError
 
-DB_URL = "postgresql://localhost/apex_ledger"
+DB_URL = os.environ.get("TEST_DB_URL", "postgresql://postgres:apex@localhost:55432/apex_ledger")
 
 @pytest.fixture
 async def store():
@@ -80,3 +80,12 @@ async def test_load_all_yields_in_global_order(store):
     all_events = [e async for e in store.load_all(from_position=0)]
     positions = [e["global_position"] for e in all_events]
     assert positions == sorted(positions)
+
+@pytest.mark.asyncio
+async def test_archive_stream_marks_archived(store):
+    stream_id = "test-archive-001"
+    await store.append(stream_id, _event("E",1), expected_version=-1)
+    await store.archive_stream(stream_id)
+    meta = await store.get_stream_metadata(stream_id)
+    assert meta is not None
+    assert meta["archived_at"] is not None

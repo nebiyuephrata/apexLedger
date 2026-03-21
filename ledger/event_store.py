@@ -40,6 +40,23 @@ class EventStore:
         self.upcasters = upcaster_registry
         self._pool: asyncpg.Pool | None = None
 
+    @staticmethod
+    def _decode_json(val):
+        """Normalize json/jsonb payloads from asyncpg."""
+        if val is None:
+            return {}
+        if isinstance(val, (dict, list)):
+            return val
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except Exception:
+                return {}
+        try:
+            return dict(val)
+        except Exception:
+            return {}
+
     async def connect(self) -> None:
         self._pool = await asyncpg.create_pool(self.db_url, min_size=2, max_size=10)
 
@@ -238,8 +255,8 @@ class EventStore:
             rows = await conn.fetch(q, *params)
             events = []
             for row in rows:
-                e = {**dict(row), "payload": dict(row["payload"]),
-                                   "metadata": dict(row["metadata"])}
+                e = {**dict(row), "payload": self._decode_json(row["payload"]),
+                                   "metadata": self._decode_json(row["metadata"])}
                 if self.upcasters: e = self.upcasters.upcast(e)
                 events.append(e)
             return events
@@ -281,8 +298,8 @@ class EventStore:
                 )
                 if not rows: break
                 for row in rows:
-                    e = {**dict(row), "payload": dict(row["payload"]),
-                                       "metadata": dict(row["metadata"])}
+                    e = {**dict(row), "payload": self._decode_json(row["payload"]),
+                                       "metadata": self._decode_json(row["metadata"])}
                     if self.upcasters: e = self.upcasters.upcast(e)
                     yield e
                 pos = rows[-1]["global_position"]
@@ -306,8 +323,8 @@ class EventStore:
                 "SELECT * FROM events WHERE event_id=$1", event_id,
             )
             if not row: return None
-            return {**dict(row), "payload": dict(row["payload"]),
-                                  "metadata": dict(row["metadata"])}
+            return {**dict(row), "payload": self._decode_json(row["payload"]),
+                                  "metadata": self._decode_json(row["metadata"])}
 
     # ─────────────────────────────────────────────────────────────────────
     # OUTBOX HELPERS
@@ -333,7 +350,7 @@ class EventStore:
                     " ORDER BY created_at ASC LIMIT $1",
                     batch_size,
                 )
-            return [{**dict(r), "payload": dict(r["payload"])} for r in rows]
+            return [{**dict(r), "payload": self._decode_json(r["payload"])} for r in rows]
 
     async def mark_outbox_published(self, outbox_ids: list[UUID]) -> None:
         """Mark a batch of outbox rows as published."""

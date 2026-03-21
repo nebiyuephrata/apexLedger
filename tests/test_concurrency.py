@@ -42,3 +42,9 @@ async def test_double_decision_occ_collision(store):
     assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}"
     assert len(errors) == 1
     assert await store.stream_version(stream_id) == 4
+    # stream has exactly 4 events total
+    events = await store.load_stream(stream_id)
+    assert len(events) == 4, f"Expected 4 events, got {len(events)}"
+    # winning append wrote at position 4
+    assert successes[0] == [4]
+    assert events[-1]["stream_position"] == 4
