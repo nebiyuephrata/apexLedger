@@ -49,6 +49,14 @@ class ApplicationSummaryProjection:
                 return datetime.now()
         return ts or datetime.now()
 
+    def _parse_ts(self, value):
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except Exception:
+                return None
+        return value
+
     def _state_from_event(self, et: str, payload: dict) -> str | None:
         mapping = {
             "ApplicationSubmitted": "SUBMITTED",
@@ -82,11 +90,13 @@ class ApplicationSummaryProjection:
 
         row = await conn.fetchrow(
             "SELECT application_id, state, applicant_id, requested_amount_usd, "
-            "risk_tier, fraud_score, compliance_status, last_event_at "
+            "approved_amount_usd, risk_tier, fraud_score, compliance_status, "
+            "decision_recommendation, agent_sessions_completed, human_reviewer_id, "
+            "final_decision_at, last_event_type, last_event_at "
             "FROM projection_application_summary WHERE application_id=$1",
             app_id,
         )
-        current = dict(row) if row else {
+        current = {
             "application_id": app_id,
             "state": None,
             "applicant_id": None,
@@ -102,6 +112,10 @@ class ApplicationSummaryProjection:
             "last_event_type": None,
             "last_event_at": None,
         }
+        if row:
+            current.update(dict(row))
+            if current.get("agent_sessions_completed") is None:
+                current["agent_sessions_completed"] = []
 
         new_state = self._state_from_event(et, payload)
         if new_state:
@@ -129,15 +143,17 @@ class ApplicationSummaryProjection:
         elif et == "HumanReviewCompleted":
             current["human_reviewer_id"] = payload.get("reviewer_id")
             current["decision_recommendation"] = payload.get("final_decision") or current.get("decision_recommendation")
-            current["final_decision_at"] = payload.get("reviewed_at")
+            current["final_decision_at"] = self._parse_ts(payload.get("reviewed_at"))
         elif et == "ApplicationApproved":
             current["approved_amount_usd"] = payload.get("approved_amount_usd")
-            current["final_decision_at"] = payload.get("approved_at")
+            current["final_decision_at"] = self._parse_ts(payload.get("approved_at"))
         elif et == "ApplicationDeclined":
-            current["final_decision_at"] = payload.get("declined_at")
+            current["final_decision_at"] = self._parse_ts(payload.get("declined_at"))
 
         current["last_event_type"] = et
         current["last_event_at"] = self._event_time(event)
+        if isinstance(current.get("final_decision_at"), str):
+            current["final_decision_at"] = self._parse_ts(current.get("final_decision_at"))
 
         await conn.execute(
             """
