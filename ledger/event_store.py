@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import AsyncGenerator
+import inspect
 from uuid import UUID
 import asyncpg
 
@@ -39,6 +40,14 @@ class EventStore:
         self.db_url = db_url
         self.upcasters = upcaster_registry
         self._pool: asyncpg.Pool | None = None
+
+    async def _apply_upcaster(self, event: dict) -> dict:
+        if not self.upcasters:
+            return event
+        result = self.upcasters.upcast(event)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     @staticmethod
     def _decode_json(val):
@@ -257,7 +266,7 @@ class EventStore:
             for row in rows:
                 e = {**dict(row), "payload": self._decode_json(row["payload"]),
                                    "metadata": self._decode_json(row["metadata"])}
-                if self.upcasters: e = self.upcasters.upcast(e)
+                e = await self._apply_upcaster(e)
                 events.append(e)
             return events
 
@@ -300,7 +309,7 @@ class EventStore:
                 for row in rows:
                     e = {**dict(row), "payload": self._decode_json(row["payload"]),
                                        "metadata": self._decode_json(row["metadata"])}
-                    if self.upcasters: e = self.upcasters.upcast(e)
+                    e = await self._apply_upcaster(e)
                     yield e
                 pos = rows[-1]["global_position"]
                 if len(rows) < batch_size: break
@@ -484,7 +493,13 @@ class InMemoryEventStore:
         if to_position is not None:
             result = [e for e in result if e["stream_position"] <= to_position]
         if self.upcasters:
-            result = [self.upcasters.upcast(dict(e)) for e in result]
+            cooked = []
+            for e in result:
+                r = self.upcasters.upcast(dict(e))
+                if inspect.isawaitable(r):
+                    r = await r
+                cooked.append(r)
+            result = cooked
         return result
 
     async def load_all(
@@ -492,7 +507,12 @@ class InMemoryEventStore:
     ):
         for event in self._global:
             if event["global_position"] >= from_position:
-                yield dict(event)
+                r = dict(event)
+                if self.upcasters:
+                    r = self.upcasters.upcast(dict(event))
+                    if inspect.isawaitable(r):
+                        r = await r
+                yield r
 
     async def get_event(self, event_id) -> dict | None:
         for event in self._global:
@@ -529,6 +549,8 @@ class InMemoryEventStore:
         self._checkpoints: dict[str, int] = {}
         # asyncio lock per stream for OCC
         self._locks: dict[str, _asyncio.Lock] = _defaultdict(_asyncio.Lock)
+        # optional upcaster registry
+        self.upcasters = None
 
     async def stream_version(self, stream_id: str) -> int:
         return self._versions.get(stream_id, -1)
@@ -582,12 +604,26 @@ class InMemoryEventStore:
             if e["stream_position"] >= from_position
             and (to_position is None or e["stream_position"] <= to_position)
         ]
-        return sorted(events, key=lambda e: e["stream_position"])
+        events = sorted(events, key=lambda e: e["stream_position"])
+        if self.upcasters:
+            cooked = []
+            for e in events:
+                r = self.upcasters.upcast(dict(e))
+                if inspect.isawaitable(r):
+                    r = await r
+                cooked.append(r)
+            events = cooked
+        return events
 
     async def load_all(self, from_position: int = 0, batch_size: int = 500):
         for e in self._global:
             if e["global_position"] >= from_position:
-                yield e
+                r = e
+                if self.upcasters:
+                    r = self.upcasters.upcast(dict(e))
+                    if inspect.isawaitable(r):
+                        r = await r
+                yield r
 
     async def get_event(self, event_id: str) -> dict | None:
         for e in self._global:
