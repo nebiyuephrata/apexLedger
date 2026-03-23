@@ -158,7 +158,11 @@ async def handle_credit_analysis_completed(store, command: Any) -> list[dict]:
     if session.application_id and session.application_id != app_id:
         raise DomainError("Agent session application_id mismatch")
 
-    if app.state not in (ApplicationState.DOCUMENTS_PROCESSED, ApplicationState.CREDIT_ANALYSIS_REQUESTED):
+    if app.state not in (
+        ApplicationState.DOCUMENTS_UPLOADED,
+        ApplicationState.DOCUMENTS_PROCESSED,
+        ApplicationState.CREDIT_ANALYSIS_REQUESTED,
+    ):
         raise DomainError(f"Application {app_id} not awaiting analysis (state={app.state})")
 
     credit_stream = f"credit-{app_id}"
