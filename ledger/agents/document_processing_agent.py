@@ -81,6 +81,13 @@ class DocumentProcessingAgent(BaseApexAgent):
         facts["extraction_notes"] = notes
         return facts
 
+    @staticmethod
+    def _coerce_document_type(raw: Any) -> DocumentType | None:
+        try:
+            return raw if isinstance(raw, DocumentType) else DocumentType(raw)
+        except Exception:
+            return None
+
     async def _extract_document_facts(self, file_path: str, document_kind: str) -> dict:
         """
         Adapter seam for the external extraction project.
@@ -162,6 +169,7 @@ class DocumentProcessingAgent(BaseApexAgent):
         pkg_events = await self.store.load_stream(pkg_stream)
 
         uploads = [e for e in events if e.get("event_type") == "DocumentUploaded"]
+        upload_requests = [e for e in events if e.get("event_type") == "DocumentUploadRequested"]
         docs: list[dict] = []
         present_types: set[DocumentType] = set()
         existing_added = {
@@ -170,6 +178,12 @@ class DocumentProcessingAgent(BaseApexAgent):
             if e.get("event_type") == "DocumentAdded"
         }
         has_package_created = any(e.get("event_type") == "PackageCreated" for e in pkg_events)
+        required_docs_payload: list[Any] = []
+        package_created = next((e.get("payload", {}) for e in reversed(pkg_events) if e.get("event_type") == "PackageCreated"), None)
+        if package_created:
+            required_docs_payload = list(package_created.get("required_documents") or [])
+        elif upload_requests:
+            required_docs_payload = list((upload_requests[-1].get("payload", {}) or {}).get("required_document_types") or [])
 
         for ev in uploads:
             p = ev.get("payload", {})
@@ -189,10 +203,16 @@ class DocumentProcessingAgent(BaseApexAgent):
             })
 
         required = {
-            DocumentType.APPLICATION_PROPOSAL,
-            DocumentType.INCOME_STATEMENT,
-            DocumentType.BALANCE_SHEET,
+            document_type
+            for document_type in (self._coerce_document_type(item) for item in required_docs_payload)
+            if document_type is not None
         }
+        if not required:
+            required = {
+                DocumentType.APPLICATION_PROPOSAL,
+                DocumentType.INCOME_STATEMENT,
+                DocumentType.BALANCE_SHEET,
+            }
         missing = [d.value for d in required if d not in present_types]
 
         ms = int((time.time() - t) * 1000)
@@ -312,7 +332,14 @@ class DocumentProcessingAgent(BaseApexAgent):
         docs = state.get("documents") or []
         doc = next((d for d in docs if d.get("document_type") == DocumentType.INCOME_STATEMENT), None)
         if not doc:
-            raise ValueError("Income statement document not found")
+            ms = int((time.time() - t) * 1000)
+            await self._record_node_execution(
+                "extract_income_statement",
+                ["document_paths"],
+                ["extraction_results"],
+                ms,
+            )
+            return state
 
         doc_id = doc.get("document_id")
         file_path = doc.get("file_path")
@@ -395,7 +422,14 @@ class DocumentProcessingAgent(BaseApexAgent):
         docs = state.get("documents") or []
         doc = next((d for d in docs if d.get("document_type") == DocumentType.BALANCE_SHEET), None)
         if not doc:
-            raise ValueError("Balance sheet document not found")
+            ms = int((time.time() - t) * 1000)
+            await self._record_node_execution(
+                "extract_balance_sheet",
+                ["document_paths"],
+                ["extraction_results"],
+                ms,
+            )
+            return state
 
         doc_id = doc.get("document_id")
         file_path = doc.get("file_path")

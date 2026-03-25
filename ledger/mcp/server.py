@@ -19,6 +19,7 @@ from .tools import (
     submit_application,
     record_credit_analysis,
     run_credit_analysis_agent,
+    run_document_processing_agent,
     run_fraud_detection_agent,
     run_compliance_agent,
     run_decision_orchestrator_agent,
@@ -52,6 +53,10 @@ async def _record_credit_analysis(payload: dict):
 @mcp.tool(name="run_credit_analysis_agent", description="Runs CreditAnalysisAgent end-to-end; may reuse an existing Gas Town session_id.")
 async def _run_credit_analysis_agent(payload: dict):
     return await run_credit_analysis_agent(payload)
+
+@mcp.tool(name="run_document_processing_agent", description="Runs DocumentProcessingAgent end-to-end using the configured extraction API when available.")
+async def _run_document_processing_agent(payload: dict):
+    return await run_document_processing_agent(payload)
 
 @mcp.tool(name="run_fraud_detection_agent", description="Runs FraudDetectionAgent end-to-end; may reuse an existing Gas Town session_id.")
 async def _run_fraud_detection_agent(payload: dict):

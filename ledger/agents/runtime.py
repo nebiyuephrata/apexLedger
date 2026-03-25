@@ -12,6 +12,8 @@ import asyncpg
 from anthropic import AsyncAnthropic
 
 from ledger.agents.credit_analysis_agent import CreditAnalysisAgent
+from ledger.agents.document_processing_agent import DocumentProcessingAgent
+from ledger.agents.extraction_api_client import DocumentExtractionApiClient
 from ledger.agents.fraud_detection_agent import FraudDetectionAgent
 from ledger.agents.compliance_agent import ComplianceAgent
 from ledger.agents.decision_orchestrator_agent import DecisionOrchestratorAgent
@@ -26,6 +28,18 @@ def build_llm_client() -> AsyncAnthropic | None:
     if not api_key:
         return None
     return AsyncAnthropic(api_key=api_key)
+
+
+def build_extraction_client() -> DocumentExtractionApiClient | None:
+    base_url = os.environ.get("DOCUMENT_EXTRACTION_API_BASE_URL")
+    if not base_url:
+        return None
+    return DocumentExtractionApiClient(
+        base_url=base_url,
+        api_key=os.environ.get("DOCUMENT_EXTRACTION_API_KEY"),
+        endpoint=os.environ.get("DOCUMENT_EXTRACTION_API_ENDPOINT", "/extract"),
+        timeout_seconds=int(os.environ.get("DOCUMENT_EXTRACTION_TIMEOUT_SECONDS", "60")),
+    )
 
 
 async def build_registry_client(db_url: str) -> tuple[asyncpg.Pool, ApplicantRegistryClient]:
@@ -59,6 +73,41 @@ async def run_credit_analysis_agent(
     )
     return {
         "agent_type": "credit_analysis",
+        "application_id": application_id,
+        "session_id": agent.session_id,
+        "session_stream": agent._session_stream,
+        "result": result,
+    }
+
+
+async def run_document_processing_agent(
+    *,
+    store,
+    registry,
+    application_id: str,
+    agent_id: str = "agent-document-1",
+    model: str = "claude-sonnet-4-20250514",
+    client: Any | None = None,
+    session_id: str | None = None,
+    context_source: str = "fresh",
+    extraction_client: Any | None = None,
+) -> dict:
+    agent = DocumentProcessingAgent(
+        agent_id=agent_id,
+        agent_type="document_processing",
+        store=store,
+        registry=registry,
+        client=client,
+        model=model,
+        extraction_client=extraction_client or build_extraction_client(),
+    )
+    result = await agent.process_application(
+        application_id,
+        session_id=session_id,
+        context_source=context_source,
+    )
+    return {
+        "agent_type": "document_processing",
         "application_id": application_id,
         "session_id": agent.session_id,
         "session_stream": agent._session_stream,

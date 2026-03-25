@@ -19,11 +19,13 @@ load_dotenv()
 
 from ledger import upcasters
 from ledger.agents.runtime import (
+    build_extraction_client,
     build_llm_client,
     build_registry_client,
     run_compliance_agent,
     run_credit_analysis_agent,
     run_decision_orchestrator_agent,
+    run_document_processing_agent,
     run_fraud_detection_agent,
 )
 from ledger.event_store import EventStore
@@ -45,8 +47,6 @@ async def main():
     parser.add_argument("--model", default=_default_model())
     args = parser.parse_args()
 
-    if args.phase == "document":
-        raise SystemExit("Document phase is held until the external extraction API is wired in.")
     store = EventStore(args.db_url, upcaster_registry=upcasters.registry)
     upcasters.registry.store = store
     await store.connect()
@@ -55,11 +55,13 @@ async def main():
 
     try:
         phase_map = {
+            "document": [("document", run_document_processing_agent)],
             "credit": [("credit", run_credit_analysis_agent)],
             "fraud": [("fraud", run_fraud_detection_agent)],
             "compliance": [("compliance", run_compliance_agent)],
             "decision": [("decision", run_decision_orchestrator_agent)],
             "all": [
+                ("document", run_document_processing_agent),
                 ("credit", run_credit_analysis_agent),
                 ("fraud", run_fraud_detection_agent),
                 ("compliance", run_compliance_agent),
@@ -68,13 +70,16 @@ async def main():
         }
 
         for label, runner in phase_map[args.phase]:
-            result = await runner(
-                store=store,
-                registry=registry,
-                application_id=args.application,
-                model=args.model,
-                client=client,
-            )
+            kwargs = {
+                "store": store,
+                "registry": registry,
+                "application_id": args.application,
+                "model": args.model,
+                "client": client,
+            }
+            if runner is run_document_processing_agent:
+                kwargs["extraction_client"] = build_extraction_client()
+            result = await runner(**kwargs)
             print(
                 f"[{label}] application={args.application} "
                 f"session_id={result['session_id']} session_stream={result['session_stream']}"

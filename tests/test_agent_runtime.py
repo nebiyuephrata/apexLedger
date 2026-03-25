@@ -7,6 +7,7 @@ import pytest
 from ledger.agents.runtime import (
     run_compliance_agent,
     run_credit_analysis_agent,
+    run_document_processing_agent,
     run_fraud_detection_agent,
 )
 from ledger.event_store import InMemoryEventStore
@@ -221,6 +222,52 @@ async def _seed_credit_ready_application(store: InMemoryEventStore, app_id: str)
     )
 
 
+async def _seed_document_ready_application(store: InMemoryEventStore, app_id: str, file_path: str) -> None:
+    await _append_event(
+        store,
+        f"loan-{app_id}",
+        ApplicationSubmitted(
+            application_id=app_id,
+            applicant_id="COMP-DOC-1",
+            requested_amount_usd="120000",
+            loan_purpose="working_capital",
+            loan_term_months=12,
+            submission_channel="web",
+            contact_email="document@test.local",
+            contact_name="Dana Document",
+            submitted_at=datetime.now(),
+            application_reference=app_id,
+        ).to_store_dict(),
+    )
+    await _append_event(
+        store,
+        f"loan-{app_id}",
+        DocumentUploadRequested(
+            application_id=app_id,
+            required_document_types=[DocumentType.INCOME_STATEMENT],
+            deadline=datetime.now(),
+            requested_by="system",
+        ).to_store_dict(),
+    )
+    await _append_event(
+        store,
+        f"loan-{app_id}",
+        DocumentUploaded(
+            application_id=app_id,
+            document_id="doc-runtime-upload",
+            document_type=DocumentType.INCOME_STATEMENT,
+            document_format="pdf",
+            filename="income.pdf",
+            file_path=file_path,
+            file_size_bytes=128,
+            file_hash="hash-runtime-upload",
+            fiscal_year=2024,
+            uploaded_at=datetime.now(),
+            uploaded_by="user-1",
+        ).to_store_dict(),
+    )
+
+
 async def _seed_fraud_ready_application(store: InMemoryEventStore, app_id: str) -> None:
     await _seed_credit_ready_application(store, app_id)
     await _append_event(
@@ -420,3 +467,44 @@ async def test_runtime_compliance_runner_reuses_existing_session_stream():
     assert result["session_id"] == session_id
     assert len(started) == 1
     assert any(event["event_type"] == "AgentSessionCompleted" for event in session_events)
+
+
+class FakeExtractionClient:
+    async def extract_financial_facts(self, *, file_path: str, document_kind: str, application_id: str) -> dict:
+        return {
+            "total_revenue": "450000",
+            "gross_profit": "180000",
+            "net_income": "55000",
+            "ebitda": None,
+            "field_confidence": {"total_revenue": 0.94},
+            "extraction_notes": [f"{document_kind} extracted from {application_id}"],
+        }
+
+
+@pytest.mark.asyncio
+async def test_runtime_document_runner_uses_injected_extraction_client(tmp_path):
+    store = InMemoryEventStore()
+    app_id = "APEX-RUNTIME-004"
+    session_id = "sess-document-runtime"
+    file_path = tmp_path / "income.pdf"
+    file_path.write_text("placeholder pdf content", encoding="utf-8")
+    await _seed_document_ready_application(store, app_id, str(file_path))
+
+    result = await run_document_processing_agent(
+        store=store,
+        registry=FakeRegistry(),
+        application_id=app_id,
+        agent_id="agent-document-runtime",
+        model="gemini-1.5-pro",
+        client=None,
+        session_id=session_id,
+        context_source="fresh",
+        extraction_client=FakeExtractionClient(),
+    )
+
+    docpkg_events = await store.load_stream(f"docpkg-{app_id}")
+    loan_events = await store.load_stream(f"loan-{app_id}")
+    assert result["session_id"] == session_id
+    assert any(event["event_type"] == "ExtractionCompleted" for event in docpkg_events)
+    assert any(event["event_type"] == "PackageReadyForAnalysis" for event in docpkg_events)
+    assert any(event["event_type"] == "CreditAnalysisRequested" for event in loan_events)
