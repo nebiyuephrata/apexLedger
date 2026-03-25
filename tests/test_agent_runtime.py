@@ -4,30 +4,43 @@ from datetime import datetime
 
 import pytest
 
-from ledger.agents.runtime import run_credit_analysis_agent
+from ledger.agents.runtime import (
+    run_compliance_agent,
+    run_credit_analysis_agent,
+    run_fraud_detection_agent,
+)
 from ledger.event_store import InMemoryEventStore
 from ledger.registry.client import CompanyProfile, ComplianceFlag, FinancialYear
 from ledger.schema.events import (
     ApplicationSubmitted,
+    ComplianceCheckRequested,
     CreditAnalysisRequested,
+    CreditAnalysisCompleted,
+    CreditDecision,
     DocumentAdded,
     DocumentType,
     DocumentUploadRequested,
     DocumentUploaded,
     ExtractionCompleted,
     FinancialFacts,
+    FraudScreeningRequested,
     PackageCreated,
+    RiskTier,
 )
 
 
 class FakeRegistry:
+    def __init__(self, jurisdiction: str = "CA", flags: list[ComplianceFlag] | None = None):
+        self.jurisdiction = jurisdiction
+        self.flags = flags or []
+
     async def get_company(self, company_id: str) -> CompanyProfile | None:
         return CompanyProfile(
             company_id=company_id,
             name="Runtime Metals",
             industry="manufacturing",
             naics="332999",
-            jurisdiction="CA",
+            jurisdiction=self.jurisdiction,
             legal_type="LLC",
             founded_year=2014,
             employee_count=75,
@@ -66,7 +79,9 @@ class FakeRegistry:
         ]
 
     async def get_compliance_flags(self, company_id: str, active_only: bool = False) -> list[ComplianceFlag]:
-        return []
+        if active_only:
+            return [flag for flag in self.flags if flag.is_active]
+        return list(self.flags)
 
     async def get_loan_relationships(self, company_id: str) -> list[dict]:
         return []
@@ -206,6 +221,72 @@ async def _seed_credit_ready_application(store: InMemoryEventStore, app_id: str)
     )
 
 
+async def _seed_fraud_ready_application(store: InMemoryEventStore, app_id: str) -> None:
+    await _seed_credit_ready_application(store, app_id)
+    await _append_event(
+        store,
+        f"credit-{app_id}",
+        CreditAnalysisCompleted(
+            application_id=app_id,
+            session_id="sess-credit-seed",
+            decision=CreditDecision(
+                risk_tier=RiskTier.MEDIUM,
+                recommended_limit_usd="200000",
+                confidence=0.81,
+                rationale="Seed credit decision.",
+            ),
+            model_version="gemini-1.5-pro",
+            model_deployment_id="dep-credit-seed",
+            input_data_hash="seed-hash",
+            analysis_duration_ms=25,
+            completed_at=datetime.now(),
+        ).to_store_dict(),
+    )
+    await _append_event(
+        store,
+        f"loan-{app_id}",
+        FraudScreeningRequested(
+            application_id=app_id,
+            requested_at=datetime.now(),
+            triggered_by_event_id="sess-credit-seed",
+        ).to_store_dict(),
+    )
+
+
+async def _seed_compliance_ready_application(store: InMemoryEventStore, app_id: str) -> None:
+    await _seed_fraud_ready_application(store, app_id)
+    await _append_event(
+        store,
+        f"fraud-{app_id}",
+        {
+            "event_type": "FraudScreeningCompleted",
+            "event_version": 1,
+            "payload": {
+                "application_id": app_id,
+                "session_id": "sess-fraud-seed",
+                "fraud_score": 0.12,
+                "risk_level": "LOW",
+                "anomalies_found": 0,
+                "recommendation": "CLEAR",
+                "screening_model_version": "gemini-1.5-pro",
+                "input_data_hash": "fraud-hash",
+                "completed_at": datetime.now().isoformat(),
+            },
+        },
+    )
+    await _append_event(
+        store,
+        f"loan-{app_id}",
+        ComplianceCheckRequested(
+            application_id=app_id,
+            requested_at=datetime.now(),
+            triggered_by_event_id="sess-fraud-seed",
+            regulation_set_version="2026-Q1",
+            rules_to_evaluate=["REG-001", "REG-002", "REG-003", "REG-004", "REG-005", "REG-006"],
+        ).to_store_dict(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_runtime_credit_runner_reuses_existing_session_stream():
     store = InMemoryEventStore()
@@ -245,6 +326,96 @@ async def test_runtime_credit_runner_reuses_existing_session_stream():
     )
 
     session_events = await store.load_stream(f"agent-credit_analysis-{session_id}")
+    started = [event for event in session_events if event["event_type"] == "AgentSessionStarted"]
+    assert result["session_id"] == session_id
+    assert len(started) == 1
+    assert any(event["event_type"] == "AgentSessionCompleted" for event in session_events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_fraud_runner_reuses_existing_session_stream():
+    store = InMemoryEventStore()
+    app_id = "APEX-RUNTIME-002"
+    session_id = "sess-fraud-runtime"
+    await _seed_fraud_ready_application(store, app_id)
+
+    await _append_event(
+        store,
+        f"agent-fraud_detection-{session_id}",
+        {
+            "event_type": "AgentSessionStarted",
+            "event_version": 1,
+            "payload": {
+                "session_id": session_id,
+                "agent_type": "fraud_detection",
+                "agent_id": "agent-fraud-runtime",
+                "application_id": app_id,
+                "model_version": "gemini-1.5-pro",
+                "langgraph_graph_version": "1.0.0",
+                "context_source": "fresh",
+                "context_token_count": 100,
+                "started_at": datetime.now().isoformat(),
+            },
+        },
+    )
+
+    result = await run_fraud_detection_agent(
+        store=store,
+        registry=FakeRegistry(),
+        application_id=app_id,
+        agent_id="agent-fraud-runtime",
+        model="gemini-1.5-pro",
+        client=None,
+        session_id=session_id,
+        context_source="prior_session_replay:sess-fraud-runtime",
+    )
+
+    session_events = await store.load_stream(f"agent-fraud_detection-{session_id}")
+    started = [event for event in session_events if event["event_type"] == "AgentSessionStarted"]
+    assert result["session_id"] == session_id
+    assert len(started) == 1
+    assert any(event["event_type"] == "AgentSessionCompleted" for event in session_events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_compliance_runner_reuses_existing_session_stream():
+    store = InMemoryEventStore()
+    app_id = "APEX-RUNTIME-003"
+    session_id = "sess-compliance-runtime"
+    await _seed_compliance_ready_application(store, app_id)
+
+    await _append_event(
+        store,
+        f"agent-compliance-{session_id}",
+        {
+            "event_type": "AgentSessionStarted",
+            "event_version": 1,
+            "payload": {
+                "session_id": session_id,
+                "agent_type": "compliance",
+                "agent_id": "agent-compliance-runtime",
+                "application_id": app_id,
+                "model_version": "gemini-1.5-pro",
+                "langgraph_graph_version": "1.0.0",
+                "context_source": "fresh",
+                "context_token_count": 100,
+                "started_at": datetime.now().isoformat(),
+            },
+        },
+    )
+
+    result = await run_compliance_agent(
+        store=store,
+        registry=FakeRegistry(),
+        application_id=app_id,
+        agent_id="agent-compliance-runtime",
+        model="gemini-1.5-pro",
+        client=None,
+        session_id=session_id,
+        context_source="prior_session_replay:sess-compliance-runtime",
+    )
+
+    session_events = await store.load_stream(f"agent-compliance-{session_id}")
     started = [event for event in session_events if event["event_type"] == "AgentSessionStarted"]
     assert result["session_id"] == session_id
     assert len(started) == 1
