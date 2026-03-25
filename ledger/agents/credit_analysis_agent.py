@@ -37,12 +37,14 @@ from __future__ import annotations
 import time, json
 from datetime import datetime
 from decimal import Decimal
-from typing import TypedDict, Annotated
+from typing import Any, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.domain.aggregates.loan_application import ApplicationState, LoanApplicationAggregate
+from ledger.domain.errors import DomainError
 from ledger.schema.events import (
     CreditRecordOpened, HistoricalProfileConsumed, ExtractedFactsConsumed,
     CreditAnalysisCompleted, CreditAnalysisDeferred,
@@ -81,9 +83,21 @@ class CreditState(TypedDict):
 # ─── AGENT ────────────────────────────────────────────────────────────────────
 
 class CreditAnalysisAgent(BaseApexAgent):
+    @staticmethod
+    def _to_dict(value: Any) -> dict:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if hasattr(value, "__dict__"):
+            return dict(vars(value))
+        raise TypeError(f"Unsupported registry payload type: {type(value)!r}")
+
+    @staticmethod
+    def _to_dict_list(values: list[Any] | None) -> list[dict]:
+        return [CreditAnalysisAgent._to_dict(v) for v in (values or [])]
 
     def build_graph(self) -> Any:
-        from typing import Any
         g = StateGraph(CreditState)
         g.add_node("validate_inputs",          self._node_validate_inputs)
         g.add_node("open_credit_record",       self._node_open_credit_record)
@@ -118,26 +132,42 @@ class CreditAnalysisAgent(BaseApexAgent):
     async def _node_validate_inputs(self, state: CreditState) -> CreditState:
         t = time.time()
         app_id = state["application_id"]
-        errors = []
+        errors: list[str] = []
+        app = await LoanApplicationAggregate.load(self.store, app_id)
+        docpkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        credit_events = await self.store.load_stream(f"credit-{app_id}")
 
-        # Load LoanApplicationAggregate to get applicant_id and amounts
-        # TODO: implement LoanApplicationAggregate.load()
-        # app = await LoanApplicationAggregate.load(self.store, app_id)
-        # if app.state not in (ApplicationState.DOCUMENTS_PROCESSED, ApplicationState.CREDIT_ANALYSIS_REQUESTED):
-        #     errors.append(f"Expected DOCUMENTS_PROCESSED, got {app.state}")
-        # state["applicant_id"]         = app.applicant_id
-        # state["requested_amount_usd"] = float(app.requested_amount_usd)
-        # state["loan_purpose"]         = app.loan_purpose.value
+        try:
+            app.require_state(
+                ApplicationState.DOCUMENTS_PROCESSED,
+                ApplicationState.CREDIT_ANALYSIS_REQUESTED,
+            )
+        except DomainError as exc:
+            errors.append(str(exc))
 
-        # PLACEHOLDER — remove when LoanApplicationAggregate is implemented
-        state["applicant_id"]         = f"COMP-001"
-        state["requested_amount_usd"] = 500_000.0
-        state["loan_purpose"]         = "working_capital"
+        if not app.applicant_id:
+            errors.append("LoanApplication is missing applicant_id")
+        if app.requested_amount_usd is None:
+            errors.append("LoanApplication is missing requested_amount_usd")
 
-        # Verify package is ready
-        # TODO: pkg = await DocumentPackageAggregate.load(self.store, app_id)
-        # if not pkg.is_ready_for_analysis:
-        #     errors.append("Document package not ready")
+        extraction_events = [
+            e for e in docpkg_events
+            if e.get("event_type") == "ExtractionCompleted"
+        ]
+        if not extraction_events:
+            errors.append("Document package does not contain ExtractionCompleted facts")
+
+        has_completed_analysis = any(
+            e.get("event_type") == "CreditAnalysisCompleted"
+            for e in credit_events
+        )
+        has_human_override = any(
+            e.get("event_type") == "HumanReviewCompleted"
+            and (e.get("payload", {}) or {}).get("override")
+            for e in app.events
+        )
+        if has_completed_analysis and not has_human_override:
+            errors.append("Credit analysis already completed without HumanReview override")
 
         ms = int((time.time() - t) * 1000)
         if errors:
@@ -145,7 +175,7 @@ class CreditAnalysisAgent(BaseApexAgent):
             raise ValueError(f"Input validation failed: {errors}")
 
         await self._record_input_validated(
-            ["application_id", "applicant_id", "document_package_ready"], ms
+            ["application_id", "applicant_id", "requested_amount_usd", "document_package_ready"], ms
         )
         await self._record_node_execution(
             "validate_inputs",
@@ -153,22 +183,27 @@ class CreditAnalysisAgent(BaseApexAgent):
             ["applicant_id", "requested_amount_usd", "loan_purpose"],
             ms,
         )
-        return {**state, "errors": errors}
+        return {
+            **state,
+            "applicant_id": app.applicant_id,
+            "requested_amount_usd": float(app.requested_amount_usd),
+            "loan_purpose": app.loan_purpose,
+            "errors": errors,
+        }
 
     # ── NODE 2: OPEN CREDIT RECORD ────────────────────────────────────────────
     async def _node_open_credit_record(self, state: CreditState) -> CreditState:
         t = time.time()
         app_id = state["application_id"]
         credit_stream = f"credit-{app_id}"
-
-        event = CreditRecordOpened(
-            application_id=app_id,
-            applicant_id=state["applicant_id"],
-            opened_at=datetime.now(),
-        ).to_store_dict()
-
-        # New stream — expected_version = -1
-        await self.store.append(credit_stream, [event], expected_version=-1)
+        existing_events = await self.store.load_stream(credit_stream)
+        if not any(e.get("event_type") == "CreditRecordOpened" for e in existing_events):
+            event = CreditRecordOpened(
+                application_id=app_id,
+                applicant_id=state["applicant_id"],
+                opened_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_with_retry(credit_stream, [event], causation_id=self.session_id)
 
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution(
@@ -183,44 +218,42 @@ class CreditAnalysisAgent(BaseApexAgent):
     async def _node_load_registry(self, state: CreditState) -> CreditState:
         t = time.time()
         applicant_id = state["applicant_id"]
+        if not self.registry:
+            raise RuntimeError("ApplicantRegistryClient is not configured for CreditAnalysisAgent")
 
         # Query Applicant Registry (read-only external database)
-        # TODO: implement RegistryClient methods
-        # profile   = await self.registry.get_company(applicant_id)
-        # financials = await self.registry.get_financial_history(applicant_id)
-        # flags     = await self.registry.get_compliance_flags(applicant_id)
-        # loans     = await self.registry.get_loan_relationships(applicant_id)
+        profile = await self.registry.get_company(applicant_id)
+        financials = await self.registry.get_financial_history(applicant_id)
+        flags = await self.registry.get_compliance_flags(applicant_id)
+        loans = await self.registry.get_loan_relationships(applicant_id)
 
-        # PLACEHOLDER
-        profile    = {"company_id": applicant_id, "name": "Company",
-                      "industry": "technology", "trajectory": "STABLE",
-                      "legal_type": "LLC", "jurisdiction": "CA"}
-        financials: list[dict] = []
-        flags:      list[dict] = []
-        loans:      list[dict] = []
+        profile_dict = self._to_dict(profile) if profile else {"company_id": applicant_id}
+        financial_dicts = self._to_dict_list(financials)
+        flag_dicts = self._to_dict_list(flags)
+        loan_dicts = [dict(loan) for loan in loans]
 
         ms = int((time.time() - t) * 1000)
         await self._record_tool_call(
             "query_applicant_registry",
             f"company_id={applicant_id} tables=[companies,financial_history,compliance_flags,loan_relationships]",
-            f"Loaded profile, {len(financials)} fiscal years, {len(flags)} flags, {len(loans)} loans",
+            f"Loaded profile, {len(financial_dicts)} fiscal years, {len(flag_dicts)} flags, {len(loan_dicts)} loans",
             ms,
         )
 
         # Record what was consumed
-        has_defaults = any(l.get("default_occurred") for l in loans)
-        traj = profile.get("trajectory", "UNKNOWN")
+        has_defaults = any(l.get("default_occurred") for l in loan_dicts)
+        traj = profile_dict.get("trajectory", "UNKNOWN")
         event = HistoricalProfileConsumed(
             application_id=state["application_id"],
             session_id=self.session_id,
-            fiscal_years_loaded=[f["fiscal_year"] for f in financials],
-            has_prior_loans=bool(loans),
+            fiscal_years_loaded=[f["fiscal_year"] for f in financial_dicts],
+            has_prior_loans=bool(loan_dicts),
             has_defaults=has_defaults,
             revenue_trajectory=traj,
-            data_hash=self._sha({"fins": financials, "flags": flags}),
+            data_hash=self._sha({"profile": profile_dict, "fins": financial_dicts, "flags": flag_dicts, "loans": loan_dicts}),
             consumed_at=datetime.now(),
         ).to_store_dict()
-        await self._append_with_retry(f"credit-{state['application_id']}", [event])
+        await self._append_with_retry(f"credit-{state['application_id']}", [event], causation_id=self.session_id)
 
         await self._record_node_execution(
             "load_applicant_registry",
@@ -230,10 +263,10 @@ class CreditAnalysisAgent(BaseApexAgent):
         )
         return {
             **state,
-            "company_profile":      profile,
-            "historical_financials": financials,
-            "compliance_flags":     flags,
-            "loan_history":         loans,
+            "company_profile":      profile_dict,
+            "historical_financials": financial_dicts,
+            "compliance_flags":     flag_dicts,
+            "loan_history":         loan_dicts,
         }
 
     # ── NODE 4: LOAD EXTRACTED FACTS ──────────────────────────────────────────
@@ -290,7 +323,7 @@ class CreditAnalysisAgent(BaseApexAgent):
             quality_flags_present=bool(quality_flags),
             consumed_at=datetime.now(),
         ).to_store_dict()
-        await self._append_with_retry(f"credit-{app_id}", [event])
+        await self._append_with_retry(f"credit-{app_id}", [event], causation_id=self.session_id)
 
         # Defer if facts are too incomplete
         critical = ["total_revenue", "net_income", "total_assets"]
@@ -302,7 +335,7 @@ class CreditAnalysisAgent(BaseApexAgent):
                 quality_issues=[f"Missing critical field: {f}" for f in missing_critical],
                 deferred_at=datetime.now(),
             ).to_store_dict()
-            await self._append_with_retry(f"credit-{app_id}", [defer_event])
+            await self._append_with_retry(f"credit-{app_id}", [defer_event], causation_id=self.session_id)
             raise ValueError(f"Credit analysis deferred: missing {missing_critical}")
 
         await self._record_node_execution(
@@ -408,7 +441,6 @@ Provide your analysis as JSON."""
         t = time.time()
         d        = dict(state["credit_decision"])
         hist     = state.get("historical_financials") or []
-        req      = state.get("requested_amount_usd") or 0
         flags    = state.get("compliance_flags") or []
         loans    = state.get("loan_history") or []
         viols:  list[str] = []
@@ -483,13 +515,17 @@ Provide your analysis as JSON."""
             requested_at=datetime.now(),
             triggered_by_event_id=self.session_id,
         ).to_store_dict()
-        await self._append_with_retry(f"loan-{app_id}", [fraud_trigger])
+        loan_positions = await self._append_with_retry(
+            f"loan-{app_id}",
+            [fraud_trigger],
+            causation_id=self.session_id,
+        )
 
         events_written = [
             {"stream_id": f"credit-{app_id}", "event_type": "CreditAnalysisCompleted",
              "stream_position": positions[0] if positions else -1},
             {"stream_id": f"loan-{app_id}", "event_type": "FraudScreeningRequested",
-             "stream_position": -1},
+             "stream_position": loan_positions[0] if loan_positions else -1},
         ]
         await self._record_output_written(
             events_written,
@@ -501,4 +537,4 @@ Provide your analysis as JSON."""
         await self._record_node_execution(
             "write_output", ["credit_decision"], ["events_written"], ms
         )
-        return {**state, "output_events": events_written, "next_agent": "fraud_detection"}
+        return {**state, "output_events": events_written, "next_agent": "fraud_detection", "next_agent_triggered": "fraud_detection"}

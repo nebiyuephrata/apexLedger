@@ -7,16 +7,19 @@ from __future__ import annotations
 import time, json
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.domain.aggregates.loan_application import ApplicationState, LoanApplicationAggregate
 from ledger.schema.events import (
+    DocumentAdded,
     DocumentFormatValidated, DocumentFormatRejected,
+    PackageCreated,
     ExtractionStarted, ExtractionCompleted, ExtractionFailed,
     QualityAssessmentCompleted, PackageReadyForAnalysis,
-    CreditAnalysisRequested, FinancialFacts, DocumentType,
+    CreditAnalysisRequested, DocumentFormat, FinancialFacts, DocumentType,
 )
 
 
@@ -42,11 +45,15 @@ class DocumentProcessingAgent(BaseApexAgent):
         extract_balance_sheet → assess_quality → write_output
 
     Output events:
-        docpkg-{id}:  DocumentFormatValidated (x per doc), ExtractionStarted (x per doc),
-                      ExtractionCompleted (x per doc), QualityAssessmentCompleted,
+        docpkg-{id}:  PackageCreated, DocumentAdded (x per doc), DocumentFormatValidated (x per doc),
+                      ExtractionStarted (x per doc), ExtractionCompleted (x per doc), QualityAssessmentCompleted,
                       PackageReadyForAnalysis
         loan-{id}:    CreditAnalysisRequested
     """
+
+    def __init__(self, *args, extraction_client: Any | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.extraction_client = extraction_client
 
     def _detect_format(self, file_path: str) -> str:
         ext = Path(file_path).suffix.lower().lstrip(".")
@@ -73,6 +80,50 @@ class DocumentProcessingAgent(BaseApexAgent):
         facts["field_confidence"] = field_conf
         facts["extraction_notes"] = notes
         return facts
+
+    async def _extract_document_facts(self, file_path: str, document_kind: str) -> dict:
+        """
+        Adapter seam for the external extraction project.
+        If an extraction client is injected, prefer that. Otherwise fall back to the local pipeline.
+        """
+        if self.extraction_client is not None:
+            extractor = getattr(self.extraction_client, "extract_financial_facts", None)
+            if extractor is None:
+                raise AttributeError("extraction_client must expose extract_financial_facts(...)")
+            result = extractor(file_path=file_path, document_kind=document_kind, application_id=self.application_id)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+
+        from document_refinery.pipeline import extract_financial_facts
+        return await extract_financial_facts(file_path, document_kind)
+
+    def _build_quality_fallback(self, combined: dict, critical_missing: list[str], anomalies: list[str]) -> dict:
+        total_assets = self._to_float(combined.get("total_assets"))
+        total_liabilities = self._to_float(combined.get("total_liabilities"))
+        total_equity = self._to_float(combined.get("total_equity"))
+        if None not in (total_assets, total_liabilities, total_equity):
+            diff = abs(total_assets - total_liabilities - total_equity)
+            if diff > 1.0 and "Balance sheet does not balance (Assets != Liabilities + Equity)" not in anomalies:
+                anomalies.append("Balance sheet does not balance (Assets != Liabilities + Equity)")
+
+        is_coherent = not critical_missing and not anomalies
+        overall_confidence = max(0.0, min(1.0, 0.92 - (0.07 * len(critical_missing)) - (0.12 if anomalies else 0.0)))
+        return {
+            "overall_confidence": overall_confidence,
+            "is_coherent": is_coherent,
+            "anomalies": anomalies,
+            "critical_missing_fields": critical_missing,
+            "reextraction_recommended": bool(critical_missing or anomalies),
+            "auditor_notes": "; ".join(anomalies) if anomalies else "Fallback quality assessment completed.",
+        }
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
 
     def build_graph(self):
         g = StateGraph(DocProcState)
@@ -104,12 +155,21 @@ class DocumentProcessingAgent(BaseApexAgent):
     async def _node_validate_inputs(self, state):
         t = time.time()
         app_id = state["application_id"]
-        stream_id = f"loan-{app_id}"
-        events = await self.store.load_stream(stream_id)
+        app = await LoanApplicationAggregate.load(self.store, app_id)
+        app.require_state(ApplicationState.DOCUMENTS_UPLOADED)
+        events = await self.store.load_stream(f"loan-{app_id}")
+        pkg_stream = f"docpkg-{app_id}"
+        pkg_events = await self.store.load_stream(pkg_stream)
 
         uploads = [e for e in events if e.get("event_type") == "DocumentUploaded"]
         docs: list[dict] = []
         present_types: set[DocumentType] = set()
+        existing_added = {
+            (e.get("payload", {}) or {}).get("document_id")
+            for e in pkg_events
+            if e.get("event_type") == "DocumentAdded"
+        }
+        has_package_created = any(e.get("event_type") == "PackageCreated" for e in pkg_events)
 
         for ev in uploads:
             p = ev.get("payload", {})
@@ -125,6 +185,7 @@ class DocumentProcessingAgent(BaseApexAgent):
                 "document_type": doc_type_enum,
                 "document_format": p.get("document_format"),
                 "file_path": p.get("file_path"),
+                "file_hash": p.get("file_hash"),
             })
 
         required = {
@@ -138,6 +199,38 @@ class DocumentProcessingAgent(BaseApexAgent):
         if missing:
             await self._record_input_failed(missing, [f"Missing required documents: {missing}"])
             raise ValueError(f"Missing required documents: {missing}")
+
+        package_events: list[dict] = []
+        if not has_package_created:
+            package_events.append(
+                PackageCreated(
+                    package_id=app_id,
+                    application_id=app_id,
+                    required_documents=sorted(required, key=lambda item: item.value),
+                    created_at=datetime.now(),
+                ).to_store_dict()
+            )
+        for doc in docs:
+            if doc["document_id"] in existing_added:
+                continue
+            try:
+                fmt = doc["document_format"]
+                doc_format = fmt if isinstance(fmt, DocumentFormat) else DocumentFormat(fmt)
+            except Exception:
+                suffix = Path(doc.get("file_path") or "").suffix.lower().lstrip(".")
+                doc_format = DocumentFormat(suffix) if suffix in {item.value for item in DocumentFormat} else DocumentFormat.PDF
+            package_events.append(
+                DocumentAdded(
+                    package_id=app_id,
+                    document_id=doc["document_id"],
+                    document_type=doc["document_type"],
+                    document_format=doc_format,
+                    file_hash=doc.get("file_hash") or "unknown",
+                    added_at=datetime.now(),
+                ).to_store_dict()
+            )
+        if package_events:
+            await self._append_with_retry(pkg_stream, package_events)
 
         await self._record_input_validated(["application_id", "document_ids", "file_paths"], ms)
         await self._record_node_execution(
@@ -234,8 +327,7 @@ class DocumentProcessingAgent(BaseApexAgent):
         await self._append_with_retry(pkg_stream, [start_event])
 
         try:
-            from document_refinery.pipeline import extract_financial_facts
-            facts_raw = await extract_financial_facts(file_path, "income_statement")
+            facts_raw = await self._extract_document_facts(file_path, "income_statement")
         except Exception as e:
             fail_event = ExtractionFailed(
                 package_id=app_id,
@@ -318,8 +410,7 @@ class DocumentProcessingAgent(BaseApexAgent):
         await self._append_with_retry(pkg_stream, [start_event])
 
         try:
-            from document_refinery.pipeline import extract_financial_facts
-            facts_raw = await extract_financial_facts(file_path, "balance_sheet")
+            facts_raw = await self._extract_document_facts(file_path, "balance_sheet")
         except Exception as e:
             fail_event = ExtractionFailed(
                 package_id=app_id,
@@ -403,31 +494,43 @@ class DocumentProcessingAgent(BaseApexAgent):
 
         critical_fields = ["total_revenue", "net_income", "ebitda", "total_assets", "total_liabilities", "total_equity"]
         critical_missing = [f for f in critical_fields if combined.get(f) is None]
-
-        def _num(val):
-            try:
-                return float(val)
-            except Exception:
-                return None
-
-        total_assets = _num(combined.get("total_assets"))
-        total_liabilities = _num(combined.get("total_liabilities"))
-        total_equity = _num(combined.get("total_equity"))
-        balance_ok = None
         anomalies: list[str] = []
-        if total_assets is not None and total_liabilities is not None and total_equity is not None:
-            diff = abs(total_assets - total_liabilities - total_equity)
-            balance_ok = diff <= 1.0
-            if not balance_ok:
-                anomalies.append("Balance sheet does not balance (Assets != Liabilities + Equity)")
+        llm_result: dict
+        tok_in = tok_out = 0
+        llm_cost = 0.0
+        quality_prompt = json.dumps(
+            {
+                "combined_facts": {k: str(v) if v is not None else None for k, v in combined.items()},
+                "field_confidence": field_conf,
+                "notes": notes,
+                "critical_fields": critical_fields,
+            },
+            indent=2,
+        )
+        system = (
+            "You are a financial document quality analyst. You receive structured data extracted "
+            "from a company's financial statements. Check ONLY:\n"
+            "Internal consistency (Gross Profit = Revenue - COGS, Assets = Liabilities + Equity).\n"
+            "Implausible values (margins > 80%, negative equity without note).\n"
+            "Critical missing fields (total_revenue, net_income, total_assets, total_liabilities).\n"
+            "Return JSON: "
+            '{"overall_confidence": float, "is_coherent": bool, "anomalies": [str], '
+            '"critical_missing_fields": [str], "reextraction_recommended": bool, "auditor_notes": str}. '
+            "DO NOT make credit or lending decisions."
+        )
+        try:
+            content, tok_in, tok_out, llm_cost = await self._call_llm(system, quality_prompt, max_tokens=512)
+            llm_result = self._parse_json(content)
+        except Exception as exc:
+            notes.append(f"LLM quality assessment fallback used: {type(exc).__name__}")
+            llm_result = self._build_quality_fallback(combined, critical_missing, anomalies)
 
-        is_coherent = (balance_ok is not False) and len(critical_missing) == 0
-        overall_confidence = 0.9
-        if critical_missing:
-            overall_confidence -= 0.05 * len(critical_missing)
-        if balance_ok is False:
-            overall_confidence -= 0.15
-        overall_confidence = max(0.0, min(1.0, overall_confidence))
+        overall_confidence = float(llm_result.get("overall_confidence", 0.0))
+        is_coherent = bool(llm_result.get("is_coherent", False))
+        anomalies = list(llm_result.get("anomalies") or [])
+        critical_missing = list(llm_result.get("critical_missing_fields") or critical_missing)
+        reextraction_recommended = bool(llm_result.get("reextraction_recommended", False))
+        auditor_notes = str(llm_result.get("auditor_notes") or "Quality assessment completed.")
 
         assessment = QualityAssessmentCompleted(
             package_id=app_id,
@@ -436,8 +539,8 @@ class DocumentProcessingAgent(BaseApexAgent):
             is_coherent=is_coherent,
             anomalies=anomalies,
             critical_missing_fields=critical_missing,
-            reextraction_recommended=bool(critical_missing) or balance_ok is False,
-            auditor_notes="; ".join(anomalies + [f"Missing: {', '.join(critical_missing)}" if critical_missing else "No critical missing fields"]),
+            reextraction_recommended=reextraction_recommended,
+            auditor_notes=auditor_notes,
             assessed_at=datetime.now(),
         ).to_store_dict()
         await self._append_with_retry(pkg_stream, [assessment])
@@ -448,6 +551,9 @@ class DocumentProcessingAgent(BaseApexAgent):
             ["extraction_results"],
             ["quality_assessment"],
             ms,
+            tok_in if tok_in else None,
+            tok_out if tok_out else None,
+            llm_cost if llm_cost else None,
         )
         return {**state, "quality_assessment": assessment["payload"]}
 

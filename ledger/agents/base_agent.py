@@ -4,9 +4,10 @@ ledger/agents/base_agent.py
 Base LangGraph agent scaffolding shared by all Apex agents.
 """
 from __future__ import annotations
-import asyncio, hashlib, json, time
+import asyncio, hashlib, json, os, re, time, urllib.error, urllib.request
 from abc import ABC, abstractmethod
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 from anthropic import AsyncAnthropic
 from langgraph.graph import StateGraph, END
@@ -26,7 +27,7 @@ class BaseApexAgent(ABC):
     Each tool/registry call must call self._record_tool_call().
     The write_output node must call self._record_output_written() then self._record_node_execution().
     """
-    def __init__(self, agent_id: str, agent_type: str, store, registry, client: AsyncAnthropic, model="claude-sonnet-4-20250514"):
+    def __init__(self, agent_id: str, agent_type: str, store, registry, client: AsyncAnthropic | Any | None, model="claude-sonnet-4-20250514"):
         self.agent_id = agent_id; self.agent_type = agent_type
         self.store = store; self.registry = registry; self.client = client; self.model = model
         self.session_id = None; self.application_id = None
@@ -190,10 +191,84 @@ class BaseApexAgent(ABC):
                 )
 
     async def _call_llm(self, system, user, max_tokens=1024):
-        resp = await self.client.messages.create(model=self.model, max_tokens=max_tokens,
-            system=system, messages=[{"role":"user","content":user}])
-        t = resp.content[0].text; i = resp.usage.input_tokens; o = resp.usage.output_tokens
-        return t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6)
+        provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+        if self.client is not None and hasattr(self.client, "messages"):
+            resp = await self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role":"user","content":user}],
+            )
+            t = resp.content[0].text
+            i = resp.usage.input_tokens
+            o = resp.usage.output_tokens
+            return t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6)
+        if provider == "gemini" or self.model.startswith("gemini"):
+            return await self._call_gemini(system, user, max_tokens=max_tokens)
+        raise RuntimeError(
+            "No LLM client configured. Provide an Anthropic client or set LLM_PROVIDER=gemini with GEMINI_API_KEY.",
+        )
+
+    async def _call_gemini(self, system: str, user: str, max_tokens: int = 1024):
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+
+        model = self.model if self.model.startswith("gemini") else os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+        payload = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+        def _request() -> tuple[str, int, int, float]:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"Gemini API error {exc.code}: {detail}") from exc
+
+            candidates = raw.get("candidates") or []
+            if not candidates:
+                raise RuntimeError(f"Gemini returned no candidates: {raw}")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts)
+            usage = raw.get("usageMetadata") or {}
+            tokens_in = int(usage.get("promptTokenCount", 0))
+            tokens_out = int(usage.get("candidatesTokenCount", 0))
+            return text, tokens_in, tokens_out, 0.0
+
+        return await asyncio.to_thread(_request)
+
+    @staticmethod
+    def _parse_json(content: str) -> dict:
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if not match:
+            raise ValueError("LLM response did not contain a JSON object")
+        parsed = json.loads(match.group(0))
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM response JSON was not an object")
+        return parsed
 
     @staticmethod
     def _sha(d): return hashlib.sha256(json.dumps(str(d),sort_keys=True).encode()).hexdigest()[:16]
