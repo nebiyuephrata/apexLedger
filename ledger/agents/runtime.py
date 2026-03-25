@@ -37,7 +37,8 @@ def build_extraction_client() -> DocumentExtractionApiClient | None:
     return DocumentExtractionApiClient(
         base_url=base_url,
         api_key=os.environ.get("DOCUMENT_EXTRACTION_API_KEY"),
-        endpoint=os.environ.get("DOCUMENT_EXTRACTION_API_ENDPOINT", "/extract"),
+        endpoint=os.environ.get("DOCUMENT_EXTRACTION_API_ENDPOINT", "/ingest/file"),
+        structured_query_endpoint=os.environ.get("DOCUMENT_EXTRACTION_STRUCTURED_QUERY_ENDPOINT", "/query/structured"),
         timeout_seconds=int(os.environ.get("DOCUMENT_EXTRACTION_TIMEOUT_SECONDS", "60")),
     )
 

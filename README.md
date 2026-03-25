@@ -12,7 +12,19 @@ docker run -d -e POSTGRES_PASSWORD=apex -e POSTGRES_DB=apex_ledger -p 5432:5432 
 
 # 3. Set environment (the .env file is git-ignored)
 cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY and DATABASE_URL
+# Edit .env — add your DATABASE_URL and LLM provider settings
+# Gemini example:
+#   LLM_PROVIDER=gemini
+#   GEMINI_API_KEY=your_key_here
+#   GEMINI_MODEL=gemini-1.5-pro
+# Anthropic example:
+#   ANTHROPIC_API_KEY=your_key_here
+#
+# Optional external extraction service (rataz-Wordz on the same PC):
+#   DOCUMENT_EXTRACTION_API_BASE_URL=http://127.0.0.1:8000
+#   DOCUMENT_EXTRACTION_API_ENDPOINT=/ingest/file
+#   DOCUMENT_EXTRACTION_STRUCTURED_QUERY_ENDPOINT=/query/structured
+#   DOCUMENT_EXTRACTION_API_KEY=
 
 # 4. Generate all data (companies + documents + seed events → DB)
 python datagen/generate_all.py --db-url postgresql://postgres:apex@localhost/apex_ledger
