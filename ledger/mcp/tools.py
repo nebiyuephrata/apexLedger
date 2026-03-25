@@ -16,9 +16,10 @@ from ledger.commands.handlers import (
 from ledger.agents.runtime import (
     build_llm_client,
     build_registry_client,
-    run_credit_analysis_agent as run_credit_analysis_agent_runtime,
-    run_fraud_detection_agent as run_fraud_detection_agent_runtime,
     run_compliance_agent as run_compliance_agent_runtime,
+    run_credit_analysis_agent as run_credit_analysis_agent_runtime,
+    run_decision_orchestrator_agent as run_decision_orchestrator_agent_runtime,
+    run_fraud_detection_agent as run_fraud_detection_agent_runtime,
 )
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate, ApplicationState
@@ -254,6 +255,32 @@ async def run_compliance_agent(command: dict) -> dict:
             registry=registry,
             application_id=command["application_id"],
             agent_id=command.get("agent_id", "agent-compliance-1"),
+            model=_default_agent_model(command),
+            client=build_llm_client(),
+            session_id=command.get("session_id"),
+            context_source=command.get("context_source", "fresh"),
+        )
+        return _ok(result)
+    except Exception as e:
+        return _err(e)
+    finally:
+        if registry_pool is not None:
+            await registry_pool.close()
+        await store.close()
+
+
+# Tool: run_decision_orchestrator_agent
+async def run_decision_orchestrator_agent(command: dict) -> dict:
+    """Runs DecisionOrchestratorAgent end-to-end; if session_id exists it reuses that Gas Town stream."""
+    store = await _with_store()
+    registry_pool = None
+    try:
+        registry_pool, registry = await build_registry_client(DB_URL)
+        result = await run_decision_orchestrator_agent_runtime(
+            store=store,
+            registry=registry,
+            application_id=command["application_id"],
+            agent_id=command.get("agent_id", "agent-orchestrator-1"),
             model=_default_agent_model(command),
             client=build_llm_client(),
             session_id=command.get("session_id"),

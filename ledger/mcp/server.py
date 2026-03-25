@@ -21,6 +21,7 @@ from .tools import (
     run_credit_analysis_agent,
     run_fraud_detection_agent,
     run_compliance_agent,
+    run_decision_orchestrator_agent,
     record_fraud_screening,
     record_compliance_check,
     generate_decision,
@@ -59,6 +60,10 @@ async def _run_fraud_detection_agent(payload: dict):
 @mcp.tool(name="run_compliance_agent", description="Runs ComplianceAgent end-to-end; may reuse an existing Gas Town session_id.")
 async def _run_compliance_agent(payload: dict):
     return await run_compliance_agent(payload)
+
+@mcp.tool(name="run_decision_orchestrator_agent", description="Runs DecisionOrchestratorAgent end-to-end; may reuse an existing Gas Town session_id.")
+async def _run_decision_orchestrator_agent(payload: dict):
+    return await run_decision_orchestrator_agent(payload)
 
 @mcp.tool(name="record_fraud_screening", description="Requires active agent session with context loaded; fraud_score in [0,1].")
 async def _record_fraud_screening(payload: dict):

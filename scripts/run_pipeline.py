@@ -23,6 +23,7 @@ from ledger.agents.runtime import (
     build_registry_client,
     run_compliance_agent,
     run_credit_analysis_agent,
+    run_decision_orchestrator_agent,
     run_fraud_detection_agent,
 )
 from ledger.event_store import EventStore
@@ -46,9 +47,6 @@ async def main():
 
     if args.phase == "document":
         raise SystemExit("Document phase is held until the external extraction API is wired in.")
-    if args.phase == "decision":
-        raise SystemExit("Decision orchestrator phase is not wired into the runner yet.")
-
     store = EventStore(args.db_url, upcaster_registry=upcasters.registry)
     upcasters.registry.store = store
     await store.connect()
@@ -60,10 +58,12 @@ async def main():
             "credit": [("credit", run_credit_analysis_agent)],
             "fraud": [("fraud", run_fraud_detection_agent)],
             "compliance": [("compliance", run_compliance_agent)],
+            "decision": [("decision", run_decision_orchestrator_agent)],
             "all": [
                 ("credit", run_credit_analysis_agent),
                 ("fraud", run_fraud_detection_agent),
                 ("compliance", run_compliance_agent),
+                ("decision", run_decision_orchestrator_agent),
             ],
         }
 

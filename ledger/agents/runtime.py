@@ -14,6 +14,7 @@ from anthropic import AsyncAnthropic
 from ledger.agents.credit_analysis_agent import CreditAnalysisAgent
 from ledger.agents.fraud_detection_agent import FraudDetectionAgent
 from ledger.agents.compliance_agent import ComplianceAgent
+from ledger.agents.decision_orchestrator_agent import DecisionOrchestratorAgent
 from ledger.registry.client import ApplicantRegistryClient
 
 
@@ -124,6 +125,39 @@ async def run_compliance_agent(
     )
     return {
         "agent_type": "compliance",
+        "application_id": application_id,
+        "session_id": agent.session_id,
+        "session_stream": agent._session_stream,
+        "result": result,
+    }
+
+
+async def run_decision_orchestrator_agent(
+    *,
+    store,
+    registry,
+    application_id: str,
+    agent_id: str = "agent-orchestrator-1",
+    model: str = "claude-sonnet-4-20250514",
+    client: Any | None = None,
+    session_id: str | None = None,
+    context_source: str = "fresh",
+) -> dict:
+    agent = DecisionOrchestratorAgent(
+        agent_id=agent_id,
+        agent_type="decision_orchestrator",
+        store=store,
+        registry=registry,
+        client=client,
+        model=model,
+    )
+    result = await agent.process_application(
+        application_id,
+        session_id=session_id,
+        context_source=context_source,
+    )
+    return {
+        "agent_type": "decision_orchestrator",
         "application_id": application_id,
         "session_id": agent.session_id,
         "session_stream": agent._session_stream,
