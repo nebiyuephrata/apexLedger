@@ -2,6 +2,7 @@ from .server import mcp
 from .tools import (
     submit_application,
     record_credit_analysis,
+    run_credit_analysis_agent,
     record_fraud_screening,
     record_compliance_check,
     generate_decision,
@@ -22,6 +23,7 @@ __all__ = [
     "mcp",
     "submit_application",
     "record_credit_analysis",
+    "run_credit_analysis_agent",
     "record_fraud_screening",
     "record_compliance_check",
     "generate_decision",

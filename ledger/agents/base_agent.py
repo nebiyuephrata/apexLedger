@@ -53,17 +53,23 @@ class BaseApexAgent(ABC):
     @abstractmethod
     def build_graph(self): raise NotImplementedError
 
-    async def process_application(self, application_id: str) -> None:
+    async def process_application(self, application_id: str, session_id: str | None = None, context_source: str = "fresh") -> dict:
         if not self._graph: self._graph = self.build_graph()
         self.application_id = application_id
-        self.session_id = f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
+        self.session_id = session_id or f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
         self._session_stream = f"agent-{self.agent_type}-{self.session_id}"
         self._t0 = time.time(); self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
         self._session_started = False; self._session_version = -1
-        await self._start_session(application_id)
+        if self.store:
+            self._session_version = await self.store.stream_version(self._session_stream)
+            if self._session_version >= 0:
+                self._session_started = True
+        if not self._session_started:
+            await self._start_session(application_id, context_source=context_source)
         try:
             result = await self._graph.ainvoke(self._initial_state(application_id))
             await self._complete_session(result)
+            return result
         except Exception as e:
             await self._fail_session(type(e).__name__, str(e)); raise
 
@@ -71,11 +77,11 @@ class BaseApexAgent(ABC):
         return {"application_id": app_id, "session_id": self.session_id,
                 "agent_id": self.agent_id, "errors": [], "output_events_written": [], "next_agent_triggered": None}
 
-    async def _start_session(self, app_id):
+    async def _start_session(self, app_id, context_source: str = "fresh"):
         await self._append_session({"event_type":"AgentSessionStarted","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"agent_id":self.agent_id,
             "application_id":app_id,"model_version":self.model,"langgraph_graph_version":LANGGRAPH_VERSION,
-            "context_source":"fresh","context_token_count":1000,"started_at":datetime.now().isoformat()}})
+            "context_source":context_source,"context_token_count":1000,"started_at":datetime.now().isoformat()}})
 
     async def _record_node_execution(self, name, in_keys, out_keys, ms, tok_in=None, tok_out=None, cost=None):
         self._seq += 1

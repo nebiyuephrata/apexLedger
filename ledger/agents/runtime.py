@@ -1,0 +1,131 @@
+"""
+ledger/agents/runtime.py
+========================
+Shared runtime helpers for running Apex agents from scripts and MCP tools.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import asyncpg
+from anthropic import AsyncAnthropic
+
+from ledger.agents.credit_analysis_agent import CreditAnalysisAgent
+from ledger.agents.fraud_detection_agent import FraudDetectionAgent
+from ledger.agents.compliance_agent import ComplianceAgent
+from ledger.registry.client import ApplicantRegistryClient
+
+
+def build_llm_client() -> AsyncAnthropic | None:
+    provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    if provider == "gemini" or os.environ.get("GEMINI_API_KEY"):
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return AsyncAnthropic(api_key=api_key)
+
+
+async def build_registry_client(db_url: str) -> tuple[asyncpg.Pool, ApplicantRegistryClient]:
+    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=4)
+    return pool, ApplicantRegistryClient(pool)
+
+
+async def run_credit_analysis_agent(
+    *,
+    store,
+    registry,
+    application_id: str,
+    agent_id: str = "agent-credit-1",
+    model: str = "claude-sonnet-4-20250514",
+    client: Any | None = None,
+    session_id: str | None = None,
+    context_source: str = "fresh",
+) -> dict:
+    agent = CreditAnalysisAgent(
+        agent_id=agent_id,
+        agent_type="credit_analysis",
+        store=store,
+        registry=registry,
+        client=client,
+        model=model,
+    )
+    result = await agent.process_application(
+        application_id,
+        session_id=session_id,
+        context_source=context_source,
+    )
+    return {
+        "agent_type": "credit_analysis",
+        "application_id": application_id,
+        "session_id": agent.session_id,
+        "session_stream": agent._session_stream,
+        "result": result,
+    }
+
+
+async def run_fraud_detection_agent(
+    *,
+    store,
+    registry,
+    application_id: str,
+    agent_id: str = "agent-fraud-1",
+    model: str = "claude-sonnet-4-20250514",
+    client: Any | None = None,
+    session_id: str | None = None,
+    context_source: str = "fresh",
+) -> dict:
+    agent = FraudDetectionAgent(
+        agent_id=agent_id,
+        agent_type="fraud_detection",
+        store=store,
+        registry=registry,
+        client=client,
+        model=model,
+    )
+    result = await agent.process_application(
+        application_id,
+        session_id=session_id,
+        context_source=context_source,
+    )
+    return {
+        "agent_type": "fraud_detection",
+        "application_id": application_id,
+        "session_id": agent.session_id,
+        "session_stream": agent._session_stream,
+        "result": result,
+    }
+
+
+async def run_compliance_agent(
+    *,
+    store,
+    registry,
+    application_id: str,
+    agent_id: str = "agent-compliance-1",
+    model: str = "claude-sonnet-4-20250514",
+    client: Any | None = None,
+    session_id: str | None = None,
+    context_source: str = "fresh",
+) -> dict:
+    agent = ComplianceAgent(
+        agent_id=agent_id,
+        agent_type="compliance",
+        store=store,
+        registry=registry,
+        client=client,
+        model=model,
+    )
+    result = await agent.process_application(
+        application_id,
+        session_id=session_id,
+        context_source=context_source,
+    )
+    return {
+        "agent_type": "compliance",
+        "application_id": application_id,
+        "session_id": agent.session_id,
+        "session_stream": agent._session_stream,
+        "result": result,
+    }

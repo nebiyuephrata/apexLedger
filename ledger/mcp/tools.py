@@ -13,6 +13,11 @@ from ledger.commands.handlers import (
     handle_decision_generated,
     handle_application_approved,
 )
+from ledger.agents.runtime import (
+    build_llm_client,
+    build_registry_client,
+    run_credit_analysis_agent as run_credit_analysis_agent_runtime,
+)
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate, ApplicationState
 from ledger.domain.errors import DomainError
@@ -93,6 +98,16 @@ async def _with_store():
     return store
 
 
+def _default_agent_model(command: dict) -> str:
+    if command.get("model_version"):
+        return command["model_version"]
+    if os.environ.get("GEMINI_MODEL"):
+        return os.environ["GEMINI_MODEL"]
+    if os.environ.get("LLM_PROVIDER", "").lower() == "gemini":
+        return "gemini-1.5-pro"
+    return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+
 # Tool: submit_application
 async def submit_application(command: dict) -> dict:
     """Requires unique application_id and valid applicant_id/loan fields."""
@@ -170,6 +185,32 @@ async def record_credit_analysis(command: dict) -> dict:
     except Exception as e:
         return _err(e)
     finally:
+        await store.close()
+
+
+# Tool: run_credit_analysis_agent
+async def run_credit_analysis_agent(command: dict) -> dict:
+    """Runs the CreditAnalysisAgent end-to-end; if session_id exists it reuses that Gas Town stream."""
+    store = await _with_store()
+    registry_pool = None
+    try:
+        registry_pool, registry = await build_registry_client(DB_URL)
+        result = await run_credit_analysis_agent_runtime(
+            store=store,
+            registry=registry,
+            application_id=command["application_id"],
+            agent_id=command.get("agent_id", "agent-credit-1"),
+            model=_default_agent_model(command),
+            client=build_llm_client(),
+            session_id=command.get("session_id"),
+            context_source=command.get("context_source", "fresh"),
+        )
+        return _ok(result)
+    except Exception as e:
+        return _err(e)
+    finally:
+        if registry_pool is not None:
+            await registry_pool.close()
         await store.close()
 
 
