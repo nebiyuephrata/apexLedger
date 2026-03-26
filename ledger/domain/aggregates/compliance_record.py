@@ -96,3 +96,16 @@ class ComplianceRecordAggregate:
                     "overall_verdict": self.overall_verdict,
                 },
             )
+
+    def require_decision_not_blocked(self) -> None:
+        blocked_verdict = str(self.overall_verdict or "").upper() == "BLOCKED"
+        if self.has_hard_block or blocked_verdict:
+            raise DomainError(
+                "Compliance hard block present; decision is not allowed",
+                code="COMPLIANCE_HARD_BLOCK",
+                context={
+                    "application_id": self.application_id,
+                    "has_hard_block": self.has_hard_block,
+                    "overall_verdict": self.overall_verdict,
+                },
+            )

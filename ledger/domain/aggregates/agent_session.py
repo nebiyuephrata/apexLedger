@@ -89,6 +89,14 @@ class AgentSessionAggregate:
                 return True
         return False
 
+    def require_started(self) -> None:
+        if not self.started:
+            raise DomainError(
+                "Agent session is missing AgentSessionStarted anchor",
+                code="MISSING_SESSION_ANCHOR",
+                context={"stream_id": self.stream_id},
+            )
+
     def require_context_loaded(self) -> None:
         if not self.context_loaded:
             raise DomainError(
@@ -108,3 +116,21 @@ class AgentSessionAggregate:
                     "actual": declared_model_version,
                 },
             )
+
+    def require_application(self, application_id: str) -> None:
+        if self.application_id and self.application_id != application_id:
+            raise DomainError(
+                "Agent session application_id mismatch",
+                code="APPLICATION_SESSION_MISMATCH",
+                context={
+                    "stream_id": self.stream_id,
+                    "expected_application_id": application_id,
+                    "actual_application_id": self.application_id,
+                },
+            )
+
+    def require_decision_context(self, application_id: str, declared_model_version: str | None = None) -> None:
+        self.require_started()
+        self.require_context_loaded()
+        self.require_model_version(declared_model_version)
+        self.require_application(application_id)

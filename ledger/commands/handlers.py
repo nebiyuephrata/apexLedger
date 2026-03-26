@@ -10,6 +10,7 @@ from typing import Any
 
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate, ApplicationState
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
+from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
 from ledger.domain.errors import DomainError
 from ledger.schema.events import (
     ApplicationSubmitted, DocumentUploadRequested, PackageCreated,
@@ -44,8 +45,7 @@ async def handle_submit_application(store, command: Any) -> list[dict]:
     app = await LoanApplicationAggregate.load(store, app_id)
 
     # 2) Validate business rules
-    if app.version != -1 or app.state != ApplicationState.NEW:
-        raise DomainError(f"Application {app_id} already exists")
+    app.require_can_submit()
 
     applicant_id = _get(command, "applicant_id")
     requested_amount_usd = _get(command, "requested_amount_usd")
@@ -151,31 +151,13 @@ async def handle_credit_analysis_completed(store, command: Any) -> list[dict]:
     session = await AgentSessionAggregate.load(store, session_stream)
 
     # 2) Validate business rules
-    if not session.started:
-        raise DomainError("Agent session is missing AgentSessionStarted anchor")
-    session.require_context_loaded()
-    session.require_model_version(_get(command, "model_version"))
-    if session.application_id and session.application_id != app_id:
-        raise DomainError("Agent session application_id mismatch")
-
-    if app.state not in (
-        ApplicationState.DOCUMENTS_UPLOADED,
-        ApplicationState.DOCUMENTS_PROCESSED,
-        ApplicationState.CREDIT_ANALYSIS_REQUESTED,
-    ):
-        raise DomainError(f"Application {app_id} not awaiting analysis (state={app.state})")
+    session.require_decision_context(app_id, _get(command, "model_version"))
+    app.require_credit_analysis_ready()
 
     credit_stream = f"credit-{app_id}"
     credit_events = await store.load_stream(credit_stream)
     has_analysis = any(e.get("event_type") == "CreditAnalysisCompleted" for e in credit_events)
-    has_override = False
-    for ev in app.events:
-        if ev.get("event_type") == "HumanReviewCompleted":
-            if ev.get("payload", {}).get("override"):
-                has_override = True
-                break
-    if has_analysis and not has_override:
-        raise DomainError("CreditAnalysisCompleted already exists without HumanReview override")
+    app.require_credit_analysis_unlocked(has_analysis)
 
     decision = _get(command, "decision")
     if not decision:
@@ -245,8 +227,7 @@ async def handle_decision_generated(store, command: Any) -> list[dict]:
         raise DomainError("application_id is required")
 
     app = await LoanApplicationAggregate.load(store, app_id)
-    if app.state not in (ApplicationState.PENDING_DECISION, ApplicationState.COMPLIANCE_CHECK_COMPLETE):
-        raise DomainError(f"Application {app_id} not ready for decision (state={app.state})")
+    app.require_decision_generation_ready()
 
     recommendation = _get(command, "recommendation")
     confidence = float(_get(command, "confidence", 0.0))
@@ -255,52 +236,39 @@ async def handle_decision_generated(store, command: Any) -> list[dict]:
     orchestrator_agent_type = _get(command, "agent_type", "decision_orchestrator")
 
     if not orchestrator_session_id:
-        raise DomainError("orchestrator_session_id is required")
+        raise DomainError("orchestrator_session_id is required", code="MISSING_ORCHESTRATOR_SESSION")
 
     # Gas Town anchor: orchestrator session must start with AgentSessionStarted
     orch_stream = f"agent-{orchestrator_agent_type}-{orchestrator_session_id}"
     orch_session = await AgentSessionAggregate.load(store, orch_stream)
-    if not orch_session.started:
-        raise DomainError("Orchestrator session missing AgentSessionStarted anchor")
-    orch_session.require_context_loaded()
-    orch_session.require_model_version(_get(command, "model_version"))
+    orch_session.require_decision_context(app_id, _get(command, "model_version"))
 
     # Confidence floor enforcement
-    if confidence < 0.60:
-        recommendation = "REFER"
+    recommendation = app.enforce_confidence_floor(recommendation, confidence)
 
     # Compliance hard block: prevent decisions if blocked
-    comp_events = await store.load_stream(f"compliance-{app_id}")
-    if any(
-        e.get("event_type") == "ComplianceRuleFailed"
-        and e.get("payload", {}).get("is_hard_block")
-        for e in comp_events
-    ):
-        raise DomainError("Compliance hard block present; decision is not allowed")
-    if any(
-        e.get("event_type") == "ComplianceCheckCompleted"
-        and str(e.get("payload", {}).get("overall_verdict", "")).upper() == "BLOCKED"
-        for e in comp_events
-    ):
-        raise DomainError("Compliance verdict BLOCKED; decision is not allowed")
+    compliance = await ComplianceRecordAggregate.load(store, app_id)
+    compliance.require_decision_not_blocked()
 
     # Causal chain validation: each contributing session must belong to this application
     for sid in contributing_sessions:
         found = False
         for at in AgentType:
             stream_id = f"agent-{at.value}-{sid}"
-            events = await store.load_stream(stream_id)
-            if not events:
+            session = await AgentSessionAggregate.load(store, stream_id)
+            if session.version == -1:
                 continue
-            first = events[0]
-            if first.get("event_type") != "AgentSessionStarted":
-                raise DomainError(f"Session {sid} missing AgentSessionStarted anchor")
-            payload = first.get("payload", {})
-            if payload.get("application_id") == app_id:
+            session.require_started()
+            session.require_application(app_id)
+            if session.application_id == app_id:
                 found = True
                 break
         if not found:
-            raise DomainError(f"Contributing session {sid} is not tied to application {app_id}")
+            raise DomainError(
+                f"Contributing session {sid} is not tied to application {app_id}",
+                code="INVALID_CAUSAL_CHAIN",
+                context={"application_id": app_id, "session_id": sid},
+            )
 
     event = DecisionGenerated(
         application_id=app_id,
@@ -339,19 +307,9 @@ async def handle_application_approved(store, command: Any) -> list[dict]:
 
     app = await LoanApplicationAggregate.load(store, app_id)
 
-    # Compliance dependency
-    comp_stream = f"compliance-{app_id}"
-    comp_events = await store.load_stream(comp_stream)
-    initiated = next((e for e in comp_events if e.get("event_type") == "ComplianceCheckInitiated"), None)
-    rules_required = initiated.get("payload", {}).get("rules_to_evaluate", []) if initiated else []
-    passed_rules = {e.get("payload", {}).get("rule_id") for e in comp_events if e.get("event_type") == "ComplianceRulePassed"}
-    failed_hard = any(
-        e.get("event_type") == "ComplianceRuleFailed" and e.get("payload", {}).get("is_hard_block")
-        for e in comp_events
-    )
-    missing = [r for r in rules_required if r not in passed_rules]
-    if failed_hard or missing:
-        raise DomainError(f"Compliance not satisfied. Missing={missing} hard_block={failed_hard}")
+    app.require_approval_state()
+    compliance = await ComplianceRecordAggregate.load(store, app_id)
+    compliance.require_all_mandatory_rules_passed()
 
     event = ApplicationApproved(
         application_id=app_id,

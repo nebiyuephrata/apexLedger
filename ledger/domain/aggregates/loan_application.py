@@ -204,14 +204,71 @@ class LoanApplicationAggregate:
     def assert_valid_transition(self, target: ApplicationState) -> None:
         allowed = VALID_TRANSITIONS.get(self.state, [])
         if target not in allowed:
-            raise DomainError(f"Invalid transition {self.state} → {target}. Allowed: {allowed}")
+            raise DomainError(
+                f"Invalid transition {self.state} → {target}. Allowed: {allowed}",
+                code="INVALID_STATE_TRANSITION",
+                context={"current_state": self.state.value, "target_state": target.value},
+            )
 
     def require_state(self, *states: ApplicationState) -> None:
         if self.state not in states:
             allowed = ", ".join([s.value for s in states])
-            raise DomainError(f"Invalid state {self.state}; expected one of: {allowed}")
+            raise DomainError(
+                f"Invalid state {self.state}; expected one of: {allowed}",
+                code="INVALID_APPLICATION_STATE",
+                context={"current_state": self.state.value, "allowed_states": [s.value for s in states]},
+            )
 
     def allow_withdrawal_from(self) -> None:
         """Validate that withdrawal can only occur before final decision."""
         if self.state in (ApplicationState.APPROVED, ApplicationState.DECLINED, ApplicationState.DECLINED_COMPLIANCE):
-            raise DomainError("Cannot withdraw after final decision")
+            raise DomainError("Cannot withdraw after final decision", code="WITHDRAWAL_NOT_ALLOWED")
+
+    def require_can_submit(self) -> None:
+        if self.version != -1 or self.state != ApplicationState.NEW:
+            raise DomainError(
+                f"Application {self.application_id} already exists",
+                code="APPLICATION_ALREADY_EXISTS",
+                context={"application_id": self.application_id, "current_state": self.state.value, "version": self.version},
+            )
+
+    def require_credit_analysis_ready(self) -> None:
+        self.require_state(
+            ApplicationState.DOCUMENTS_UPLOADED,
+            ApplicationState.DOCUMENTS_PROCESSED,
+            ApplicationState.CREDIT_ANALYSIS_REQUESTED,
+        )
+
+    def has_human_override(self) -> bool:
+        return any(
+            ev.get("event_type") == "HumanReviewCompleted"
+            and bool(ev.get("payload", {}).get("override"))
+            for ev in self.events
+        )
+
+    def require_credit_analysis_unlocked(self, has_existing_analysis: bool) -> None:
+        if has_existing_analysis and not self.has_human_override():
+            raise DomainError(
+                "CreditAnalysisCompleted already exists without HumanReview override",
+                code="MODEL_VERSION_LOCKED",
+                context={"application_id": self.application_id},
+            )
+
+    def require_decision_generation_ready(self) -> None:
+        self.require_state(
+            ApplicationState.PENDING_DECISION,
+            ApplicationState.COMPLIANCE_CHECK_REQUESTED,
+            ApplicationState.COMPLIANCE_CHECK_COMPLETE,
+        )
+
+    def enforce_confidence_floor(self, recommendation: str | None, confidence: float | None) -> str | None:
+        if confidence is not None and float(confidence) < 0.60:
+            return "REFER"
+        return recommendation
+
+    def require_approval_state(self) -> None:
+        self.require_state(
+            ApplicationState.PENDING_DECISION,
+            ApplicationState.PENDING_HUMAN_REVIEW,
+            ApplicationState.REFERRED,
+        )
