@@ -209,11 +209,92 @@ class BaseApexAgent(ABC):
             i = resp.usage.input_tokens
             o = resp.usage.output_tokens
             return t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6)
+        if self._should_use_openrouter(provider):
+            return await self._call_openrouter(system, user, max_tokens=max_tokens)
         if provider == "gemini" or self.model.startswith("gemini"):
             return await self._call_gemini(system, user, max_tokens=max_tokens)
         raise RuntimeError(
-            "No LLM client configured. Provide an Anthropic client or set LLM_PROVIDER=gemini with GEMINI_API_KEY.",
+            "No LLM client configured. Provide an Anthropic client, configure OpenRouter, or set LLM_PROVIDER=gemini with GEMINI_API_KEY.",
         )
+
+    @staticmethod
+    def _should_use_openrouter(provider: str) -> bool:
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if provider == "openrouter" or bool(openrouter_key):
+            return True
+        # Support current local setup where an OpenRouter key was placed in GEMINI_API_KEY.
+        return gemini_key.startswith("sk-or-")
+
+    def _resolve_openrouter_key(self) -> str:
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if key:
+            return key
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if gemini_key.startswith("sk-or-"):
+            return gemini_key
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+    def _resolve_openrouter_model(self) -> str:
+        model = os.environ.get("OPENROUTER_MODEL")
+        if model:
+            return model
+        if "/" in self.model:
+            return self.model
+        if self.model.startswith("gemini"):
+            return f"google/{self.model}"
+        gemini_model = os.environ.get("GEMINI_MODEL")
+        if gemini_model:
+            return gemini_model if "/" in gemini_model else f"google/{gemini_model}"
+        return "google/gemini-2.5-flash"
+
+    async def _call_openrouter(self, system: str, user: str, max_tokens: int = 1024):
+        api_key = self._resolve_openrouter_key()
+        model = self._resolve_openrouter_model()
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        if os.environ.get("OPENROUTER_SITE_URL"):
+            headers["HTTP-Referer"] = os.environ["OPENROUTER_SITE_URL"]
+        if os.environ.get("OPENROUTER_APP_NAME"):
+            headers["X-Title"] = os.environ["OPENROUTER_APP_NAME"]
+        url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions"
+
+        def _request() -> tuple[str, int, int, float]:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"OpenRouter API error {exc.code}: {detail}") from exc
+
+            choices = raw.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"OpenRouter returned no choices: {raw}")
+            message = choices[0].get("message", {}) or {}
+            text = message.get("content", "")
+            usage = raw.get("usage") or {}
+            tokens_in = int(usage.get("prompt_tokens", 0))
+            tokens_out = int(usage.get("completion_tokens", 0))
+            return text, tokens_in, tokens_out, 0.0
+
+        return await asyncio.to_thread(_request)
 
     async def _call_gemini(self, system: str, user: str, max_tokens: int = 1024):
         api_key = os.environ.get("GEMINI_API_KEY")

@@ -22,7 +22,8 @@ from ledger.registry.client import ApplicantRegistryClient
 
 def build_llm_client() -> AsyncAnthropic | None:
     provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
-    if provider == "gemini" or os.environ.get("GEMINI_API_KEY"):
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if provider in {"gemini", "openrouter"} or os.environ.get("OPENROUTER_API_KEY") or gemini_key.startswith("sk-or-") or gemini_key:
         return None
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
