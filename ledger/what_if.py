@@ -62,11 +62,12 @@ async def run_what_if(store, application_id: str, branch_global_position: int, c
 
     # ensure counterfactual events have ids
     cf_events = []
-    for ev in counterfactual_events:
+    for index, ev in enumerate(counterfactual_events, start=1):
         ev = dict(ev)
         ev.setdefault("event_id", f"cf-{uuid4().hex}")
         if not ev.get("stream_id") and (ev.get("payload") or {}).get("application_id") == application_id:
             ev["stream_id"] = f"loan-{application_id}"
+        ev.setdefault("global_position", branch_global_position + (index / 1000))
         cf_events.append(ev)
 
     # start skip set with branch event + counterfactual ids
