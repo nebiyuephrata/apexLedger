@@ -271,7 +271,12 @@ class EventStore:
             return events
 
     async def load_all(
-        self, from_position: int = 0, batch_size: int = 500
+        self,
+        from_position: int | None = None,
+        batch_size: int = 500,
+        *,
+        from_global_position: int | None = None,
+        event_types: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> AsyncGenerator[dict, None]:
         """
         Async generator yielding all events by global_position.
@@ -295,16 +300,28 @@ class EventStore:
                     pos = rows[-1]["global_position"]
                     if len(rows) < batch_size: break
         """
+        start_pos = from_global_position if from_global_position is not None else (from_position or 0)
+        filters = set(event_types or [])
+
         async with self._pool.acquire() as conn:
-            pos = from_position
+            pos = start_pos
             while True:
-                rows = await conn.fetch(
-                    "SELECT global_position, stream_id, stream_position,"
-                    " event_type, event_version, payload, metadata, recorded_at"
-                    " FROM events WHERE global_position > $1"
-                    " ORDER BY global_position ASC LIMIT $2",
-                    pos, batch_size,
-                )
+                if filters:
+                    rows = await conn.fetch(
+                        "SELECT global_position, stream_id, stream_position,"
+                        " event_type, event_version, payload, metadata, recorded_at"
+                        " FROM events WHERE global_position > $1 AND event_type = ANY($2::text[])"
+                        " ORDER BY global_position ASC LIMIT $3",
+                        pos, list(filters), batch_size,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT global_position, stream_id, stream_position,"
+                        " event_type, event_version, payload, metadata, recorded_at"
+                        " FROM events WHERE global_position > $1"
+                        " ORDER BY global_position ASC LIMIT $2",
+                        pos, batch_size,
+                    )
                 if not rows: break
                 for row in rows:
                     e = {**dict(row), "payload": self._decode_json(row["payload"]),
@@ -615,9 +632,18 @@ class InMemoryEventStore:
             events = cooked
         return events
 
-    async def load_all(self, from_position: int = 0, batch_size: int = 500):
+    async def load_all(
+        self,
+        from_position: int | None = None,
+        batch_size: int = 500,
+        *,
+        from_global_position: int | None = None,
+        event_types: list[str] | tuple[str, ...] | set[str] | None = None,
+    ):
+        start_pos = from_global_position if from_global_position is not None else (from_position or 0)
+        filters = set(event_types or [])
         for e in self._global:
-            if e["global_position"] >= from_position:
+            if e["global_position"] >= start_pos and (not filters or e["event_type"] in filters):
                 r = e
                 if self.upcasters:
                     r = self.upcasters.upcast(dict(e))
