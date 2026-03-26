@@ -86,6 +86,18 @@ def _app_submitted(app_id: str):
     }
 
 
+def _decision_ready_events(app_id: str) -> list[dict]:
+    return [
+        _app_submitted(app_id),
+        {"event_type": "DocumentUploadRequested", "payload": {"application_id": app_id}},
+        {"event_type": "DocumentUploaded", "payload": {"application_id": app_id, "document_id": "doc-1"}},
+        {"event_type": "CreditAnalysisRequested", "payload": {"application_id": app_id}},
+        {"event_type": "FraudScreeningRequested", "payload": {"application_id": app_id}},
+        {"event_type": "ComplianceCheckRequested", "payload": {"application_id": app_id}},
+        {"event_type": "DecisionRequested", "payload": {"application_id": app_id}},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_state_reconstruction_load():
     app_id = f"APEX-{uuid4().hex[:6]}"
@@ -106,6 +118,7 @@ async def test_state_reconstruction_load():
     assert agg.state == ApplicationState.APPROVED
     assert agg.applicant_id == "COMP-001"
     assert agg.requested_amount_usd == 100000.0
+    assert agg.canonical_state == "FinalApproved"
 
 
 @pytest.mark.asyncio
@@ -296,7 +309,7 @@ async def test_confidence_floor_forces_refer():
     app_id = f"APEX-{uuid4().hex[:6]}"
     store = InMemoryStore({
         f"loan-{app_id}": [
-            _app_submitted(app_id),
+            *_decision_ready_events(app_id),
             {"event_type": "DecisionGenerated", "event_version": 2, "payload": {
                 "application_id": app_id,
                 "orchestrator_session_id": "sess-orch",
@@ -309,6 +322,46 @@ async def test_confidence_floor_forces_refer():
     })
     agg = await LoanApplicationAggregate.load(store, app_id)
     assert agg.decision_recommendation == "REFER"
+    assert agg.state == ApplicationState.PENDING_HUMAN_REVIEW
+    assert agg.canonical_state == "DeclinedPendingHuman"
+
+
+@pytest.mark.asyncio
+async def test_decision_generated_sets_pending_human_states():
+    app_id = f"APEX-{uuid4().hex[:6]}"
+    approve_store = InMemoryStore({
+        f"loan-{app_id}": [
+            *_decision_ready_events(app_id),
+            {"event_type": "DecisionGenerated", "event_version": 2, "payload": {
+                "application_id": app_id,
+                "orchestrator_session_id": "sess-orch",
+                "recommendation": "APPROVE",
+                "confidence": 0.88,
+                "executive_summary": "approve",
+                "generated_at": datetime.now().isoformat(),
+            }},
+        ]
+    })
+    approve_agg = await LoanApplicationAggregate.load(approve_store, app_id)
+    assert approve_agg.state == ApplicationState.APPROVED_PENDING_HUMAN
+    assert approve_agg.canonical_state == "ApprovedPendingHuman"
+
+    decline_store = InMemoryStore({
+        f"loan-{app_id}": [
+            *_decision_ready_events(app_id),
+            {"event_type": "DecisionGenerated", "event_version": 2, "payload": {
+                "application_id": app_id,
+                "orchestrator_session_id": "sess-orch",
+                "recommendation": "DECLINE",
+                "confidence": 0.88,
+                "executive_summary": "decline",
+                "generated_at": datetime.now().isoformat(),
+            }},
+        ]
+    })
+    decline_agg = await LoanApplicationAggregate.load(decline_store, app_id)
+    assert decline_agg.state == ApplicationState.DECLINED_PENDING_HUMAN
+    assert decline_agg.canonical_state == "DeclinedPendingHuman"
 
 
 @pytest.mark.asyncio

@@ -593,6 +593,7 @@ async def record_human_review(command: dict) -> dict:
             approval = await handle_application_approved(store, command)
             events.extend(approval)
         elif str(final_decision).upper() == "DECLINE":
+            app.require_decline_state()
             decline = ApplicationDeclined(
                 application_id=app_id,
                 decline_reasons=command.get("decline_reasons", ["HUMAN_REVIEW"]),

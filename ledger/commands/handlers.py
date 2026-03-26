@@ -250,25 +250,17 @@ async def handle_decision_generated(store, command: Any) -> list[dict]:
     compliance = await ComplianceRecordAggregate.load(store, app_id)
     compliance.require_decision_not_blocked()
 
-    # Causal chain validation: each contributing session must belong to this application
+    # Causal chain validation via aggregate guard
+    loaded_sessions = []
     for sid in contributing_sessions:
-        found = False
         for at in AgentType:
             stream_id = f"agent-{at.value}-{sid}"
             session = await AgentSessionAggregate.load(store, stream_id)
             if session.version == -1:
                 continue
-            session.require_started()
-            session.require_application(app_id)
-            if session.application_id == app_id:
-                found = True
-                break
-        if not found:
-            raise DomainError(
-                f"Contributing session {sid} is not tied to application {app_id}",
-                code="INVALID_CAUSAL_CHAIN",
-                context={"application_id": app_id, "session_id": sid},
-            )
+            loaded_sessions.append(session)
+            break
+    app.require_contributing_sessions(contributing_sessions, loaded_sessions)
 
     event = DecisionGenerated(
         application_id=app_id,

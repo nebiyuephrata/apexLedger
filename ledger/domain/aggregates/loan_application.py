@@ -21,6 +21,7 @@ class ApplicationState(str, Enum):
     FRAUD_SCREENING_REQUESTED = "FRAUD_SCREENING_REQUESTED"; FRAUD_SCREENING_COMPLETE = "FRAUD_SCREENING_COMPLETE"
     COMPLIANCE_CHECK_REQUESTED = "COMPLIANCE_CHECK_REQUESTED"; COMPLIANCE_CHECK_COMPLETE = "COMPLIANCE_CHECK_COMPLETE"
     PENDING_DECISION = "PENDING_DECISION"; PENDING_HUMAN_REVIEW = "PENDING_HUMAN_REVIEW"
+    APPROVED_PENDING_HUMAN = "APPROVED_PENDING_HUMAN"; DECLINED_PENDING_HUMAN = "DECLINED_PENDING_HUMAN"
     APPROVED = "APPROVED"; DECLINED = "DECLINED"; DECLINED_COMPLIANCE = "DECLINED_COMPLIANCE"
     REFERRED = "REFERRED"
     WITHDRAWN = "WITHDRAWN"
@@ -37,8 +38,16 @@ VALID_TRANSITIONS = {
     ApplicationState.FRAUD_SCREENING_COMPLETE: [ApplicationState.COMPLIANCE_CHECK_REQUESTED],
     ApplicationState.COMPLIANCE_CHECK_REQUESTED: [ApplicationState.PENDING_DECISION, ApplicationState.DECLINED_COMPLIANCE],
     ApplicationState.COMPLIANCE_CHECK_COMPLETE: [ApplicationState.PENDING_DECISION, ApplicationState.DECLINED_COMPLIANCE],
-    ApplicationState.PENDING_DECISION: [ApplicationState.APPROVED, ApplicationState.DECLINED,
-                                        ApplicationState.PENDING_HUMAN_REVIEW, ApplicationState.REFERRED],
+    ApplicationState.PENDING_DECISION: [
+        ApplicationState.APPROVED_PENDING_HUMAN,
+        ApplicationState.DECLINED_PENDING_HUMAN,
+        ApplicationState.PENDING_HUMAN_REVIEW,
+        ApplicationState.REFERRED,
+        ApplicationState.APPROVED,
+        ApplicationState.DECLINED,
+    ],
+    ApplicationState.APPROVED_PENDING_HUMAN: [ApplicationState.APPROVED],
+    ApplicationState.DECLINED_PENDING_HUMAN: [ApplicationState.DECLINED],
     ApplicationState.PENDING_HUMAN_REVIEW: [ApplicationState.APPROVED, ApplicationState.DECLINED],
 }
 
@@ -60,6 +69,26 @@ class LoanApplicationAggregate:
     approved_amount_usd: float | None = None
     version: int = -1
     events: list[dict] = field(default_factory=list)
+
+    @property
+    def canonical_state(self) -> str:
+        mapping = {
+            ApplicationState.SUBMITTED: "Submitted",
+            ApplicationState.CREDIT_ANALYSIS_REQUESTED: "AwaitingAnalysis",
+            ApplicationState.FRAUD_SCREENING_REQUESTED: "AwaitingAnalysis",
+            ApplicationState.CREDIT_ANALYSIS_COMPLETE: "AnalysisComplete",
+            ApplicationState.FRAUD_SCREENING_COMPLETE: "AnalysisComplete",
+            ApplicationState.COMPLIANCE_CHECK_REQUESTED: "ComplianceReview",
+            ApplicationState.COMPLIANCE_CHECK_COMPLETE: "ComplianceReview",
+            ApplicationState.PENDING_DECISION: "PendingDecision",
+            ApplicationState.APPROVED_PENDING_HUMAN: "ApprovedPendingHuman",
+            ApplicationState.DECLINED_PENDING_HUMAN: "DeclinedPendingHuman",
+            ApplicationState.PENDING_HUMAN_REVIEW: "DeclinedPendingHuman",
+            ApplicationState.APPROVED: "FinalApproved",
+            ApplicationState.DECLINED: "FinalDeclined",
+            ApplicationState.DECLINED_COMPLIANCE: "FinalDeclined",
+        }
+        return mapping.get(self.state, self.state.value.title())
 
     @classmethod
     async def load(cls, store, application_id: str) -> "LoanApplicationAggregate":
@@ -110,6 +139,10 @@ class LoanApplicationAggregate:
             rec = (p.get("recommendation") or "").upper()
             if rec in ("REFER", "REFERRED", "HUMAN_REVIEW"):
                 return ApplicationState.PENDING_HUMAN_REVIEW
+            if rec == "APPROVE":
+                return ApplicationState.APPROVED_PENDING_HUMAN
+            if rec == "DECLINE":
+                return ApplicationState.DECLINED_PENDING_HUMAN
             return None
         if et == "HumanReviewRequested": return ApplicationState.PENDING_HUMAN_REVIEW
         if et == "ApplicationApproved": return ApplicationState.APPROVED
@@ -178,6 +211,10 @@ class LoanApplicationAggregate:
         rec = (rec or "").upper()
         if rec in ("REFER", "REFERRED", "HUMAN_REVIEW"):
             self.state = ApplicationState.PENDING_HUMAN_REVIEW
+        elif rec == "APPROVE":
+            self.state = ApplicationState.APPROVED_PENDING_HUMAN
+        elif rec == "DECLINE":
+            self.state = ApplicationState.DECLINED_PENDING_HUMAN
 
     def _on_HumanReviewRequested(self, p: dict) -> None:
         self.state = ApplicationState.PENDING_HUMAN_REVIEW
@@ -269,6 +306,32 @@ class LoanApplicationAggregate:
     def require_approval_state(self) -> None:
         self.require_state(
             ApplicationState.PENDING_DECISION,
+            ApplicationState.APPROVED_PENDING_HUMAN,
             ApplicationState.PENDING_HUMAN_REVIEW,
             ApplicationState.REFERRED,
         )
+
+    def require_decline_state(self) -> None:
+        self.require_state(
+            ApplicationState.PENDING_DECISION,
+            ApplicationState.DECLINED_PENDING_HUMAN,
+            ApplicationState.PENDING_HUMAN_REVIEW,
+            ApplicationState.REFERRED,
+        )
+
+    def require_contributing_sessions(
+        self,
+        contributing_session_ids: list[str],
+        sessions: list[Any],
+    ) -> None:
+        session_map = {getattr(session, "session_id", None): session for session in sessions if getattr(session, "session_id", None)}
+        for sid in contributing_session_ids:
+            session = session_map.get(sid)
+            if session is None:
+                raise DomainError(
+                    f"Contributing session {sid} is not tied to application {self.application_id}",
+                    code="INVALID_CAUSAL_CHAIN",
+                    context={"application_id": self.application_id, "session_id": sid},
+                )
+            session.require_started()
+            session.require_application(self.application_id)
