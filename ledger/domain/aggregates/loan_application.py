@@ -5,7 +5,8 @@ LoanApplication aggregate. Replays its stream to rebuild state.
 
 IMPORTANT:
   - _on_* methods only update internal state (no validation or I/O).
-  - Business rule validation belongs in command handlers.
+  - Business rule validation lives in aggregate guard methods so handlers can
+    follow the CQRS load → validate → determine → append pattern.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -284,6 +285,7 @@ class LoanApplicationAggregate:
         )
 
     def require_credit_analysis_unlocked(self, has_existing_analysis: bool) -> None:
+        """Rule: model version locking (no re-analysis without human override)."""
         if has_existing_analysis and not self.has_human_override():
             raise DomainError(
                 "CreditAnalysisCompleted already exists without HumanReview override",
@@ -299,6 +301,7 @@ class LoanApplicationAggregate:
         )
 
     def enforce_confidence_floor(self, recommendation: str | None, confidence: float | None) -> str | None:
+        """Rule: confidence floor (below 0.60 forces REFER)."""
         if confidence is not None and float(confidence) < 0.60:
             return "REFER"
         return recommendation
@@ -324,6 +327,7 @@ class LoanApplicationAggregate:
         contributing_session_ids: list[str],
         sessions: list[Any],
     ) -> None:
+        """Rule: causal chain enforcement for contributing agent sessions."""
         session_map = {getattr(session, "session_id", None): session for session in sessions if getattr(session, "session_id", None)}
         for sid in contributing_session_ids:
             session = session_map.get(sid)

@@ -130,6 +130,7 @@ class AgentSessionAggregate:
             )
 
     def require_decision_context(self, application_id: str, declared_model_version: str | None = None) -> None:
+        """Rule: Gas Town anchor + model version guard before any decision write."""
         self.require_started()
         self.require_context_loaded()
         self.require_model_version(declared_model_version)

@@ -84,6 +84,7 @@ class ComplianceRecordAggregate:
         return [rule_id for rule_id in self.rules_to_evaluate if rule_id not in self.passed_rules]
 
     def require_all_mandatory_rules_passed(self) -> None:
+        """Rule: compliance dependency before approval."""
         missing = self.missing_required_rules()
         if self.has_hard_block or missing:
             raise DomainError(
@@ -98,6 +99,7 @@ class ComplianceRecordAggregate:
             )
 
     def require_decision_not_blocked(self) -> None:
+        """Rule: hard blocks prevent decision generation."""
         blocked_verdict = str(self.overall_verdict or "").upper() == "BLOCKED"
         if self.has_hard_block or blocked_verdict:
             raise DomainError(
