@@ -64,13 +64,37 @@ class ProjectionDaemon:
             projection_name, position,
         )
 
-    async def get_lag(self, projection_name: str) -> int:
+    async def get_lag(self, projection_name: str) -> dict[str, int]:
         if not self._pool:
             self._pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=2)
         async with self._pool.acquire() as conn:
-            max_pos = await conn.fetchval("SELECT COALESCE(MAX(global_position),0) FROM events")
+            max_pos = int(await conn.fetchval("SELECT COALESCE(MAX(global_position),0) FROM events"))
             last = await self._load_checkpoint(conn, projection_name)
-            return int(max_pos) - int(last)
+            latest_row = await conn.fetchrow(
+                "SELECT global_position, recorded_at FROM events ORDER BY global_position DESC LIMIT 1"
+            )
+            processed_row = None
+            if last > 0:
+                processed_row = await conn.fetchrow(
+                    "SELECT global_position, recorded_at FROM events WHERE global_position=$1",
+                    last,
+                )
+
+            lag_ms = 0
+            if latest_row and max_pos > last:
+                latest_ts = latest_row["recorded_at"]
+                if processed_row:
+                    processed_ts = processed_row["recorded_at"]
+                    lag_ms = max(0, int((latest_ts - processed_ts).total_seconds() * 1000))
+                else:
+                    lag_ms = max(0, int((self.poll_interval_ms or 0)))
+
+            return {
+                "lag_ms": lag_ms,
+                "last_processed_position": int(last),
+                "latest_position": max_pos,
+                "position_delta": max(0, max_pos - int(last)),
+            }
 
     async def run_once(self):
         if not self._pool:

@@ -258,9 +258,11 @@ async def test_lag_and_rebuild():
     ])
     await daemon.run_once()
     lag = await daemon.get_lag("application_summary")
-    assert lag == 0
+    assert lag["lag_ms"] == 0
+    assert lag["position_delta"] == 0
 
     await daemon.rebuild_from_scratch("application_summary")
     lag2 = await daemon.get_lag("application_summary")
-    assert lag2 == 0
+    assert lag2["lag_ms"] == 0
+    assert lag2["position_delta"] == 0
     await store.close()
