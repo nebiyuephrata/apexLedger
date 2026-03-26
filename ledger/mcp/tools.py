@@ -54,6 +54,7 @@ DB_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:apex@localhost:55
 class ToolError(BaseModel):
     error_type: str
     message: str
+    context: dict = Field(default_factory=dict)
     expected_version: int | None = None
     actual_version: int | None = None
     suggested_action: str | None = None
@@ -76,23 +77,43 @@ def _err(exc: Exception) -> dict:
             error=ToolError(
                 error_type="OptimisticConcurrencyError",
                 message=str(exc),
+                context={"stream_id": exc.stream_id},
                 expected_version=exc.expected,
                 actual_version=exc.actual,
                 suggested_action="reload_stream_and_retry",
             ),
         ).model_dump()
     if isinstance(exc, DomainError):
+        suggested_action = {
+            "APPLICATION_ALREADY_EXISTS": "use_a_new_application_id",
+            "INVALID_APPLICATION_STATE": "reload_application_summary_and_retry_when_state_is_ready",
+            "INVALID_STATE_TRANSITION": "reload_application_summary_and_retry_when_state_is_ready",
+            "MISSING_SESSION_ANCHOR": "call_start_agent_session_then_retry",
+            "CONTEXT_NOT_LOADED": "load_or_reuse_a_context_ready_session_then_retry",
+            "MODEL_VERSION_MISMATCH": "reload_session_and_retry_with_matching_model_version",
+            "APPLICATION_SESSION_MISMATCH": "use_a_session_for_the_same_application_then_retry",
+            "MODEL_VERSION_LOCKED": "wait_for_human_override_or_stop_retrying",
+            "COMPLIANCE_HARD_BLOCK": "stop_automation_and_request_human_review",
+            "COMPLIANCE_NOT_SATISFIED": "review_compliance_results_and_resolve_missing_rules",
+            "INVALID_CAUSAL_CHAIN": "reload_contributing_sessions_and_retry",
+        }.get(exc.code, "fix_inputs_and_retry")
         return ToolResponse(
             ok=False,
             error=ToolError(
                 error_type="DomainError",
                 message=str(exc),
-                suggested_action="fix_inputs_and_retry",
+                context=exc.context,
+                suggested_action=suggested_action,
             ),
         ).model_dump()
     return ToolResponse(
         ok=False,
-        error=ToolError(error_type=type(exc).__name__, message=str(exc)),
+        error=ToolError(
+            error_type=type(exc).__name__,
+            message=str(exc),
+            context={},
+            suggested_action="inspect_error_and_retry",
+        ),
     ).model_dump()
 
 
