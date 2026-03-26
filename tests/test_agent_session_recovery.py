@@ -61,12 +61,13 @@ async def test_reconstruct_agent_context_returns_last_node_and_output():
 
     context = await BaseApexAgent.reconstruct_agent_context(store, stream_id)
 
-    assert context["session_id"] == "sess-1234"
-    assert context["agent_type"] == "document_processing"
-    assert context["application_id"] == "APP-0001"
-    assert context["context_source"] == "fresh"
-    assert context["last_node_name"] == "extract_income_statement"
-    assert context["last_node_sequence"] == 2
-    assert context["completed_nodes"] == ["validate_inputs", "extract_income_statement"]
-    assert context["last_output"]["events_written"][0]["event_type"] == "ExtractionCompleted"
-    assert context["last_event_type"] == "AgentOutputWritten"
+    assert context.session_id == "sess-1234"
+    assert context.agent_type == "document_processing"
+    assert context.application_id == "APP-0001"
+    assert context.context_source == "fresh"
+    assert context.last_node_name == "extract_income_statement"
+    assert context.last_node_sequence == 2
+    assert context.completed_nodes == ["validate_inputs", "extract_income_statement"]
+    assert context.last_output["events_written"][0]["event_type"] == "ExtractionCompleted"
+    assert context.last_event_type == "AgentOutputWritten"
+    assert context.last_event_position == 4

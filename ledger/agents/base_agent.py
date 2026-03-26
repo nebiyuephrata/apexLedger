@@ -511,66 +511,10 @@ class BaseApexAgent(ABC):
             return
 
     @staticmethod
-    async def reconstruct_agent_context(store, session_stream: str) -> dict:
+    async def reconstruct_agent_context(store, session_stream: str):
         """
-        Replay an AgentSession stream and return a resume context.
-        Returns:
-            {
-              "session_id": str,
-              "agent_type": str,
-              "application_id": str,
-              "context_source": str,
-              "last_node_name": str | None,
-              "last_node_sequence": int | None,
-              "completed_nodes": list[str],
-              "last_output": dict | None,
-              "last_event_type": str | None,
-            }
+        Replay an AgentSession stream and return a typed AgentContext.
+        Delegates to the Gas Town reconstruction logic for a consistent contract.
         """
-        events = await store.load_stream(session_stream)
-        if not events:
-            raise ValueError(f"No events found for session stream: {session_stream}")
-
-        first_type = events[0].get("event_type")
-        if first_type not in ("AgentSessionStarted", "AgentContextLoaded"):
-            raise ValueError("AgentSessionStarted or AgentContextLoaded must be the first event in a session stream")
-
-        session_id = None
-        agent_type = None
-        application_id = None
-        context_source = None
-        last_node = None
-        completed_nodes: list[str] = []
-        last_output = None
-        last_event_type = None
-
-        for ev in events:
-            et = ev.get("event_type")
-            last_event_type = et
-            p = ev.get("payload", {})
-            if et in ("AgentSessionStarted", "AgentContextLoaded"):
-                session_id = p.get("session_id") or session_id
-                agent_type = p.get("agent_type") or agent_type
-                application_id = p.get("application_id") or application_id
-                context_source = p.get("context_source") or context_source
-            elif et == "AgentNodeExecuted":
-                name = p.get("node_name")
-                seq = p.get("node_sequence")
-                if name:
-                    completed_nodes.append(name)
-                if last_node is None or (seq is not None and seq >= (last_node.get("node_sequence") or -1)):
-                    last_node = {"node_name": name, "node_sequence": seq}
-            elif et == "AgentOutputWritten":
-                last_output = p
-
-        return {
-            "session_id": session_id,
-            "agent_type": agent_type,
-            "application_id": application_id,
-            "context_source": context_source,
-            "last_node_name": last_node.get("node_name") if last_node else None,
-            "last_node_sequence": last_node.get("node_sequence") if last_node else None,
-            "completed_nodes": completed_nodes,
-            "last_output": last_output,
-            "last_event_type": last_event_type,
-        }
+        from ledger.integrity.gas_town import reconstruct_agent_context
+        return await reconstruct_agent_context(store, session_stream)
