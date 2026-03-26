@@ -155,14 +155,14 @@ class FraudDetectionAgent(BaseApexAgent):
                 )
             )
 
-        severity_scores = {"LOW": 0.12, "MEDIUM": 0.24, "HIGH": 0.38}
+        severity_scores = {"LOW": 0.10, "MEDIUM": 0.20, "HIGH": 0.34}
         fraud_score = min(0.98, sum(severity_scores.get(a["severity"], 0.18) for a in anomalies))
-        if fraud_score >= 0.75:
+        if fraud_score > 0.60:
             risk_level = "HIGH"
-            recommendation = "ESCALATE"
-        elif fraud_score >= 0.40:
+            recommendation = "DECLINE"
+        elif fraud_score >= 0.30:
             risk_level = "MEDIUM"
-            recommendation = "REVIEW"
+            recommendation = "FLAG_FOR_REVIEW"
         else:
             risk_level = "LOW"
             recommendation = "CLEAR"
@@ -351,7 +351,7 @@ Return ONLY JSON:
 {
   "fraud_score": <float 0.0-1.0>,
   "risk_level": "LOW" | "MEDIUM" | "HIGH",
-  "recommendation": "CLEAR" | "REVIEW" | "ESCALATE",
+  "recommendation": "CLEAR" | "FLAG_FOR_REVIEW" | "DECLINE",
   "anomalies": [
     {
       "anomaly_type": "REVENUE_DISCREPANCY" | "BALANCE_SHEET_INCONSISTENCY" | "UNUSUAL_SUBMISSION_PATTERN" | "IDENTITY_MISMATCH" | "DOCUMENT_ALTERATION_SUSPECTED",
@@ -390,6 +390,17 @@ Do not make compliance or lending decisions."""
             }
         except Exception:
             result = fallback
+
+        # Deterministic policy thresholds override free-form LLM recommendations.
+        if result["fraud_score"] > 0.60:
+            result["risk_level"] = "HIGH"
+            result["recommendation"] = "DECLINE"
+        elif result["fraud_score"] >= 0.30:
+            if result["risk_level"] == "LOW":
+                result["risk_level"] = "MEDIUM"
+            result["recommendation"] = "FLAG_FOR_REVIEW"
+        else:
+            result["recommendation"] = "CLEAR"
 
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution(

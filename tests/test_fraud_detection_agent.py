@@ -218,8 +218,8 @@ async def test_fraud_agent_generates_events_and_triggers_compliance():
     assert types[0] == "FraudScreeningInitiated"
     assert "FraudAnomalyDetected" in types
     assert types[-1] == "FraudScreeningCompleted"
-    assert fraud_events[-1]["payload"]["fraud_score"] >= 0.7
-    assert fraud_events[-1]["payload"]["recommendation"] == "ESCALATE"
+    assert fraud_events[-1]["payload"]["fraud_score"] > 0.60
+    assert fraud_events[-1]["payload"]["recommendation"] == "DECLINE"
     assert any(event["event_type"] == "ComplianceCheckRequested" for event in loan_events)
     assert session_events[0]["event_type"] == "AgentSessionStarted"
     assert session_events[-1]["event_type"] == "AgentSessionCompleted"

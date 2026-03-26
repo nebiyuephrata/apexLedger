@@ -272,11 +272,25 @@ async def _seed_orchestrator_ready_application(store: InMemoryEventStore, app_id
     await _append_event(
         store,
         f"compliance-{app_id}",
+        ComplianceRulePassed(
+            application_id=app_id,
+            session_id="sess-comp-orch",
+            rule_id="REG-003",
+            rule_name="Jurisdiction",
+            rule_version="2026-Q1-v1",
+            evidence_hash="hash-3",
+            evaluation_notes="passed",
+            evaluated_at=datetime.now(),
+        ).to_store_dict(),
+    )
+    await _append_event(
+        store,
+        f"compliance-{app_id}",
         ComplianceCheckCompleted(
             application_id=app_id,
             session_id="sess-comp-orch",
-            rules_evaluated=2,
-            rules_passed=2,
+            rules_evaluated=3,
+            rules_passed=3,
             rules_failed=0,
             rules_noted=0,
             has_hard_block=False,
@@ -322,9 +336,11 @@ async def test_orchestrator_agent_generates_decision():
     loan_events = await store.load_stream(f"loan-{app_id}")
     session_events = await store.load_stream(agent._session_stream)
     decisions = [event for event in loan_events if event["event_type"] == "DecisionGenerated"]
+    approvals = [event for event in loan_events if event["event_type"] == "ApplicationApproved"]
     assert len(decisions) == 1
     assert decisions[0]["payload"]["recommendation"] == "APPROVE"
     assert decisions[0]["payload"]["contributing_sessions"] == ["sess-credit-orch", "sess-fraud-orch", "sess-comp-orch"]
+    assert len(approvals) == 1
     assert not any(event["event_type"] == "HumanReviewRequested" for event in loan_events)
     assert session_events[0]["event_type"] == "AgentSessionStarted"
     assert session_events[-1]["event_type"] == "AgentSessionCompleted"
@@ -365,3 +381,39 @@ async def test_orchestrator_agent_forces_refer_and_requests_human_review():
     assert len(decisions) == 1
     assert decisions[0]["payload"]["recommendation"] == "REFER"
     assert len(review_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_records_decline_terminal_event():
+    store = InMemoryEventStore()
+    app_id = "APEX-ORCH-003"
+    await _seed_orchestrator_ready_application(store, app_id, fraud_score=0.12)
+
+    agent = DecisionOrchestratorAgent(
+        agent_id="agent-orch-3",
+        agent_type="decision_orchestrator",
+        store=store,
+        registry=FakeRegistry(),
+        client=FakeLLMClient(
+            """
+            {
+              "recommendation": "DECLINE",
+              "confidence": 0.91,
+              "approved_amount_usd": null,
+              "conditions": [],
+              "executive_summary": "Decline due to concentrated downside risk.",
+              "key_risks": ["Concentrated downside risk"]
+            }
+            """
+        ),
+        model="gemini-orchestrator",
+    )
+
+    await agent.process_application(app_id)
+
+    loan_events = await store.load_stream(f"loan-{app_id}")
+    decisions = [event for event in loan_events if event["event_type"] == "DecisionGenerated"]
+    declines = [event for event in loan_events if event["event_type"] == "ApplicationDeclined"]
+    assert len(decisions) == 1
+    assert decisions[0]["payload"]["recommendation"] == "DECLINE"
+    assert len(declines) == 1

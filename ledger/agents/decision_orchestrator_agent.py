@@ -14,10 +14,10 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 
 from ledger.agents.base_agent import BaseApexAgent
-from ledger.commands.handlers import handle_decision_generated
+from ledger.commands.handlers import handle_application_approved, handle_decision_generated
 from ledger.domain.aggregates.loan_application import ApplicationState, LoanApplicationAggregate
 from ledger.domain.errors import DomainError
-from ledger.schema.events import HumanReviewRequested
+from ledger.schema.events import ApplicationDeclined, HumanReviewRequested
 
 
 class OrchestratorState(TypedDict):
@@ -92,19 +92,10 @@ class DecisionOrchestratorAgent(BaseApexAgent):
         app_id = state["application_id"]
         errors: list[str] = []
         app = await LoanApplicationAggregate.load(self.store, app_id)
-        comp_events = await self.store.load_stream(f"compliance-{app_id}")
-
         try:
             app.require_state(ApplicationState.PENDING_DECISION)
         except DomainError as exc:
             errors.append(str(exc))
-
-        if any(
-            e.get("event_type") == "ComplianceRuleFailed"
-            and e.get("payload", {}).get("is_hard_block")
-            for e in comp_events
-        ):
-            errors.append("Compliance hard block present; decision orchestration is not allowed")
 
         ms = int((time.time() - t) * 1000)
         if errors:
@@ -112,7 +103,7 @@ class DecisionOrchestratorAgent(BaseApexAgent):
             raise ValueError(f"Input validation failed: {errors}")
 
         await self._record_input_validated(
-            ["application_id", "pending_decision", "no_hard_block"],
+            ["application_id", "pending_decision"],
             ms,
         )
         await self._record_node_execution(
@@ -318,11 +309,11 @@ Do not invent missing source evidence."""
             conditions.append("Quarterly covenant monitoring required.")
             confidence = 0.74
 
-        if fraud_score >= 0.75:
+        if fraud_score > 0.60:
             recommendation = "REFER"
             confidence = min(confidence, 0.55)
             risks.append("Fraud score exceeds the escalation threshold.")
-        elif fraud_score >= 0.40:
+        elif fraud_score >= 0.30:
             recommendation = "REFER"
             confidence = min(confidence, 0.62)
             risks.append("Fraud findings require human review before binding action.")
@@ -356,18 +347,23 @@ Do not invent missing source evidence."""
         recommendation = state.get("recommendation") or "REFER"
         confidence = float(state.get("confidence") or 0.0)
         fraud_score = float((state.get("fraud_result") or {}).get("fraud_score", 0.0))
+        compliance_verdict = str((state.get("compliance_result") or {}).get("overall_verdict", "CLEAR")).upper()
         constraints = list(state.get("hard_constraints_applied") or [])
         conditions = list(state.get("conditions") or [])
         key_risks = list(state.get("key_risks") or [])
 
-        if confidence < 0.60 and recommendation != "REFER":
+        if compliance_verdict == "BLOCKED":
+            recommendation = "DECLINE"
+            constraints.append("COMPLIANCE_BLOCKED")
+            key_risks.append("Recommendation forced to DECLINE because compliance verdict is BLOCKED.")
+        elif confidence < 0.60 and recommendation != "REFER":
             recommendation = "REFER"
             constraints.append("CONFIDENCE_FLOOR")
             key_risks.append("Recommendation forced to REFER because confidence is below 0.60.")
-        if fraud_score >= 0.75 and recommendation != "REFER":
+        if fraud_score > 0.60 and recommendation not in {"REFER", "DECLINE"}:
             recommendation = "REFER"
             constraints.append("HIGH_FRAUD_ESCALATION")
-            key_risks.append("Recommendation forced to REFER due to high fraud score.")
+            key_risks.append("Recommendation forced to REFER due to fraud score above 0.60.")
         if recommendation == "REFER" and "Human loan officer review required." not in conditions:
             conditions.append("Human loan officer review required.")
 
@@ -390,11 +386,12 @@ Do not invent missing source evidence."""
     async def _node_write_output(self, state: OrchestratorState) -> OrchestratorState:
         t = time.time()
         app_id = state["application_id"]
+        recommendation = (state.get("recommendation") or "REFER").upper()
         command = {
             "application_id": app_id,
             "orchestrator_session_id": self.session_id,
             "agent_type": "decision_orchestrator",
-            "recommendation": state.get("recommendation"),
+            "recommendation": recommendation,
             "confidence": state.get("confidence"),
             "approved_amount_usd": (
                 Decimal(str(state["approved_amount"])) if state.get("approved_amount") is not None else None
@@ -408,8 +405,46 @@ Do not invent missing source evidence."""
             "causation_id": self.session_id,
         }
         events = await handle_decision_generated(self.store, command)
+        extra_event = None
 
-        if (state.get("recommendation") or "").upper() == "REFER":
+        if recommendation == "APPROVE":
+            app = await LoanApplicationAggregate.load(self.store, app_id)
+            approval_events = await handle_application_approved(
+                self.store,
+                {
+                    "application_id": app_id,
+                    "approved_amount_usd": state.get("approved_amount") or app.requested_amount_usd or 0,
+                    "interest_rate_pct": 12.5,
+                    "term_months": app.loan_term_months or 12,
+                    "conditions": state.get("conditions") or [],
+                    "approved_by": self.agent_id,
+                    "effective_date": datetime.now().strftime("%Y-%m-%d"),
+                    "approved_at": datetime.now(),
+                    "causation_id": self.session_id,
+                },
+            )
+            events.extend(approval_events)
+        elif recommendation == "DECLINE":
+            decline_event = ApplicationDeclined(
+                application_id=app_id,
+                decline_reasons=list(state.get("key_risks") or ["Decision orchestrator decline recommendation."]),
+                declined_by=self.agent_id,
+                adverse_action_notice_required=True,
+                adverse_action_codes=list(state.get("hard_constraints_applied") or ["ORCH_DECLINE"]),
+                declined_at=datetime.now(),
+            ).to_store_dict()
+            positions = await self._append_with_retry(
+                f"loan-{app_id}",
+                [decline_event],
+                causation_id=self.session_id,
+            )
+            events.append(decline_event)
+            extra_event = {
+                "stream_id": f"loan-{app_id}",
+                "event_type": "ApplicationDeclined",
+                "stream_position": positions[0] if positions else -1,
+            }
+        elif recommendation == "REFER":
             loan_events = await self.store.load_stream(f"loan-{app_id}")
             decision_event_id = None
             for event in reversed(loan_events):
@@ -436,17 +471,16 @@ Do not invent missing source evidence."""
                 "event_type": "HumanReviewRequested",
                 "stream_position": positions[0] if positions else -1,
             }
-        else:
-            extra_event = None
-
         loan_events = await self.store.load_stream(f"loan-{app_id}")
         decision_position = -1
+        approval_position = -1
         for event in reversed(loan_events):
             if event.get("event_type") == "DecisionGenerated":
                 payload = event.get("payload", {})
                 if payload.get("orchestrator_session_id") == self.session_id:
                     decision_position = event.get("stream_position", -1)
-                    break
+            elif event.get("event_type") == "ApplicationApproved" and approval_position == -1:
+                approval_position = event.get("stream_position", -1)
 
         events_written = [
             {
@@ -455,12 +489,20 @@ Do not invent missing source evidence."""
                 "stream_position": decision_position,
             }
         ]
+        if recommendation == "APPROVE":
+            events_written.append(
+                {
+                    "stream_id": f"loan-{app_id}",
+                    "event_type": "ApplicationApproved",
+                    "stream_position": approval_position,
+                }
+            )
         if extra_event:
             events_written.append(extra_event)
 
         await self._record_output_written(
             events_written,
-            f"Decision generated: {state.get('recommendation')} at {float(state.get('confidence') or 0.0):.0%} confidence.",
+            f"Decision generated: {recommendation} at {float(state.get('confidence') or 0.0):.0%} confidence.",
         )
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution(
@@ -472,6 +514,6 @@ Do not invent missing source evidence."""
         return {
             **state,
             "output_events": events_written,
-            "next_agent": None if (state.get("recommendation") or "").upper() == "REFER" else "human_review",
-            "next_agent_triggered": None,
+            "next_agent": "human_review" if recommendation == "REFER" else None,
+            "next_agent_triggered": "human_review" if recommendation == "REFER" else None,
         }
