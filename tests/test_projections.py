@@ -13,6 +13,7 @@ import pytest
 import asyncpg
 
 from ledger.event_store import EventStore
+from ledger.commands.handlers import handle_submit_application
 from ledger.projections import (
     ProjectionDaemon,
     ApplicationSummaryProjection,
@@ -265,4 +266,81 @@ async def test_lag_and_rebuild():
     lag2 = await daemon.get_lag("application_summary")
     assert lag2["lag_ms"] == 0
     assert lag2["position_delta"] == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_projection_slo_under_load():
+    store = EventStore(DB_URL)
+    try:
+        await store.connect()
+    except Exception:
+        pytest.skip("PostgreSQL not available for projection tests")
+
+    conn = await asyncpg.connect(DB_URL)
+    await _prepare(conn, ["application_summary", "agent_performance", "compliance_audit"])
+    await conn.close()
+
+    daemon = ProjectionDaemon(DB_URL, [
+        ApplicationSummaryProjection(),
+        AgentPerformanceProjection(),
+        ComplianceAuditProjection(),
+    ], poll_interval_ms=50, batch_size=200)
+
+    async def _submit(i: int):
+        app_id = f"APEX-SLO-{uuid4().hex[:6]}-{i}"
+        await handle_submit_application(store, {
+            "application_id": app_id,
+            "applicant_id": "COMP-001",
+            "requested_amount_usd": 100000,
+            "loan_purpose": "working_capital",
+            "loan_term_months": 24,
+            "submission_channel": "web",
+            "contact_email": "x@example.com",
+            "contact_name": "X",
+            "auto_document_upload": False,
+        })
+        now = datetime.now()
+        await store.append(
+            f"compliance-{app_id}",
+            [
+                {"event_type": "ComplianceCheckInitiated", "event_version": 1, "payload": {
+                    "application_id": app_id,
+                    "session_id": f"sess-{i}",
+                    "regulation_set_version": "2026-Q1",
+                    "rules_to_evaluate": ["REG-001"],
+                    "initiated_at": now.isoformat(),
+                }},
+                {"event_type": "ComplianceCheckCompleted", "event_version": 1, "payload": {
+                    "application_id": app_id,
+                    "session_id": f"sess-{i}",
+                    "rules_evaluated": 1,
+                    "rules_passed": 1,
+                    "rules_failed": 0,
+                    "rules_noted": 0,
+                    "has_hard_block": False,
+                    "overall_verdict": "CLEAR",
+                    "completed_at": (now + timedelta(milliseconds=10)).isoformat(),
+                }},
+            ],
+            expected_version=-1,
+        )
+
+    runner = asyncio.create_task(daemon.start())
+    try:
+        await asyncio.gather(*[_submit(i) for i in range(50)])
+        # wait for catch-up or timeout
+        for _ in range(100):
+            lag_app = await daemon.get_lag("application_summary")
+            lag_comp = await daemon.get_lag("compliance_audit")
+            if lag_app["position_delta"] == 0 and lag_comp["position_delta"] == 0:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        daemon.stop()
+        await daemon.close()
+        runner.cancel()
+
+    assert lag_app["lag_ms"] <= 500
+    assert lag_comp["lag_ms"] <= 2000
     await store.close()
