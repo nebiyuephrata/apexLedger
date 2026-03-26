@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 import os
+from datetime import timezone
 
 from pydantic import BaseModel, Field
 
@@ -132,6 +133,27 @@ def _default_agent_model(command: dict) -> str:
     if os.environ.get("LLM_PROVIDER", "").lower() == "gemini":
         return "gemini-1.5-pro"
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+
+def _matches_entity(event: dict, entity_id: str, entity_type: str | None = None) -> bool:
+    stream_id = str(event.get("stream_id", ""))
+    if stream_id == f"audit-{entity_id}":
+        return False
+    if stream_id.endswith(entity_id):
+        return True
+    payload = event.get("payload") or {}
+    if payload.get("application_id") == entity_id or payload.get("entity_id") == entity_id:
+        return True
+    return False
+
+
+async def _load_entity_events(store: EventStore, entity_id: str, entity_type: str | None = None) -> list[dict]:
+    events: list[dict] = []
+    async for event in store.load_all(from_global_position=0):
+        if _matches_entity(event, entity_id, entity_type):
+            events.append(dict(event))
+    events.sort(key=lambda ev: ev.get("global_position", 0))
+    return events
 
 
 # Tool: submit_application
@@ -594,6 +616,7 @@ async def run_integrity_check(command: dict) -> dict:
     store = await _with_store()
     try:
         entity_id = command["entity_id"]
+        entity_type = command.get("entity_type", "application")
         stream_id = f"audit-{entity_id}"
         events = await store.load_stream(stream_id)
         if events:
@@ -602,28 +625,63 @@ async def run_integrity_check(command: dict) -> dict:
             if last_ts:
                 if isinstance(last_ts, str):
                     last_ts = datetime.fromisoformat(last_ts)
-                if datetime.now() - last_ts < timedelta(minutes=1):
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                now_ts = command.get("check_timestamp")
+                if isinstance(now_ts, str):
+                    now_ts = datetime.fromisoformat(now_ts)
+                if now_ts is None:
+                    now_ts = datetime.now(timezone.utc)
+                elif now_ts.tzinfo is None:
+                    now_ts = now_ts.replace(tzinfo=timezone.utc)
+                if now_ts - last_ts < timedelta(minutes=1):
                     raise DomainError("Integrity check rate limited (1/minute)")
 
-        chain_hash = compute_chain_hash(events)
+        audited_events = await _load_entity_events(store, entity_id, entity_type)
+        previous_check = events[-1].get("payload", {}) if events else None
+        previous_hash = previous_check.get("integrity_hash") if previous_check else None
+        tamper_detected = False
+        chain_valid = True
+
+        if previous_check:
+            prior_count = int(previous_check.get("events_verified_count", 0))
+            prior_previous_hash = previous_check.get("previous_hash")
+            prior_hash = compute_chain_hash(audited_events[:prior_count], initial_hash=prior_previous_hash)
+            tamper_detected = prior_hash != previous_check.get("integrity_hash")
+            chain_valid = not tamper_detected
+
+        chain_hash = compute_chain_hash(audited_events, initial_hash=previous_hash)
+        check_timestamp = command.get("check_timestamp")
+        if isinstance(check_timestamp, str):
+            check_timestamp = datetime.fromisoformat(check_timestamp)
+        if check_timestamp is None:
+            check_timestamp = datetime.now(timezone.utc)
+
         event = {
             "event_type": "AuditIntegrityCheckRun",
             "event_version": 1,
             "payload": {
-                "entity_type": command.get("entity_type", "application"),
+                "entity_type": entity_type,
                 "entity_id": entity_id,
-                "check_timestamp": datetime.now().isoformat(),
-                "events_verified_count": len(events),
+                "check_timestamp": check_timestamp.isoformat(),
+                "events_verified_count": len(audited_events),
                 "integrity_hash": chain_hash,
-                "previous_hash": events[-1].get("payload", {}).get("integrity_hash") if events else None,
-                "chain_valid": True,
-                "tamper_detected": False,
+                "previous_hash": previous_hash,
+                "chain_valid": chain_valid,
+                "tamper_detected": tamper_detected,
             },
         }
 
         ver = await store.stream_version(stream_id)
         await store.append(stream_id, [event], expected_version=ver)
-        return _ok({"event": event})
+        return _ok(
+            {
+                "event": event,
+                "chain_valid": chain_valid,
+                "tamper_detected": tamper_detected,
+                "events_verified_count": len(audited_events),
+            }
+        )
     except Exception as e:
         return _err(e)
     finally:
