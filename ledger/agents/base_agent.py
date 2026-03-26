@@ -5,12 +5,22 @@ Base LangGraph agent scaffolding shared by all Apex agents.
 """
 from __future__ import annotations
 import asyncio, hashlib, json, os, re, time, urllib.error, urllib.request
+from contextlib import nullcontext
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 from anthropic import AsyncAnthropic
 from langgraph.graph import StateGraph, END
+
+try:
+    from langsmith import Client as LangSmithClient
+    from langsmith import trace as langsmith_trace
+    LANGSMITH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    LangSmithClient = None
+    langsmith_trace = None
+    LANGSMITH_AVAILABLE = False
 
 LANGGRAPH_VERSION = "1.0.0"
 MAX_OCC_RETRIES = 5
@@ -36,6 +46,8 @@ class BaseApexAgent(ABC):
         self._session_version = -1
         self._graph = None
         self._session_started = False
+        self._langsmith_client = None
+        self._langsmith_root_run = None
         self._primary_stream_prefix = {
             "document_processing": "docpkg-",
             "credit_analysis": "credit-",
@@ -64,14 +76,43 @@ class BaseApexAgent(ABC):
             self._session_version = await self.store.stream_version(self._session_stream)
             if self._session_version >= 0:
                 self._session_started = True
-        if not self._session_started:
-            await self._start_session(application_id, context_source=context_source)
-        try:
-            result = await self._graph.ainvoke(self._initial_state(application_id))
-            await self._complete_session(result)
-            return result
-        except Exception as e:
-            await self._fail_session(type(e).__name__, str(e)); raise
+        trace_ctx = self._langsmith_trace(
+            name=f"{self.agent_type}.process_application",
+            run_type="chain",
+            inputs={
+                "application_id": application_id,
+                "session_id": self.session_id,
+                "context_source": context_source,
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "model": self.model,
+            },
+            tags=["apex-ledger", "agent-run", self.agent_type],
+            metadata={"langgraph_graph_version": LANGGRAPH_VERSION},
+        )
+        with trace_ctx as root_run:
+            self._langsmith_root_run = root_run
+            try:
+                if not self._session_started:
+                    await self._start_session(application_id, context_source=context_source)
+                result = await self._graph.ainvoke(self._initial_state(application_id))
+                await self._complete_session(result)
+                if root_run is not None:
+                    root_run.add_outputs(
+                        {
+                            "next_agent_triggered": result.get("next_agent_triggered"),
+                            "output_events_written": result.get("output_events_written", []),
+                            "errors": result.get("errors", []),
+                        }
+                    )
+                return result
+            except Exception as e:
+                if root_run is not None:
+                    root_run.error = f"{type(e).__name__}: {e}"
+                await self._fail_session(type(e).__name__, str(e))
+                raise
+            finally:
+                self._langsmith_root_run = None
 
     def _initial_state(self, app_id):
         return {"application_id": app_id, "session_id": self.session_id,
@@ -92,6 +133,21 @@ class BaseApexAgent(ABC):
             "node_sequence":self._seq,"input_keys":in_keys,"output_keys":out_keys,
             "llm_called":tok_in is not None,"llm_tokens_input":tok_in,"llm_tokens_output":tok_out,
             "llm_cost_usd":cost,"duration_ms":ms,"executed_at":datetime.now().isoformat()}})
+        self._record_langsmith_span(
+            name=f"{self.agent_type}.{name}",
+            run_type="chain",
+            inputs={"input_keys": in_keys},
+            outputs={
+                "output_keys": out_keys,
+                "duration_ms": ms,
+                "llm_called": tok_in is not None,
+                "llm_tokens_input": tok_in,
+                "llm_tokens_output": tok_out,
+                "llm_cost_usd": cost,
+            },
+            tags=["agent-node", self.agent_type, name],
+            metadata={"node_sequence": self._seq},
+        )
 
     async def _record_input_validated(self, inputs_validated: list[str], ms: int):
         await self._append_session({"event_type":"AgentInputValidated","event_version":1,"payload":{
@@ -108,6 +164,13 @@ class BaseApexAgent(ABC):
             "session_id":self.session_id,"agent_type":self.agent_type,"tool_name":tool,
             "tool_input_summary":inp,"tool_output_summary":out,"tool_duration_ms":ms,
             "called_at":datetime.now().isoformat()}})
+        self._record_langsmith_span(
+            name=f"{self.agent_type}.{tool}",
+            run_type="tool",
+            inputs={"tool_input_summary": inp},
+            outputs={"tool_output_summary": out, "tool_duration_ms": ms},
+            tags=["agent-tool", self.agent_type, tool],
+        )
 
     async def _record_output_written(self, events_written, summary):
         await self._append_session({"event_type":"AgentOutputWritten","event_version":1,"payload":{
@@ -198,24 +261,49 @@ class BaseApexAgent(ABC):
 
     async def _call_llm(self, system, user, max_tokens=1024):
         provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
-        if self.client is not None and hasattr(self.client, "messages"):
-            resp = await self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role":"user","content":user}],
-            )
-            t = resp.content[0].text
-            i = resp.usage.input_tokens
-            o = resp.usage.output_tokens
-            return t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6)
-        if self._should_use_openrouter(provider):
-            return await self._call_openrouter(system, user, max_tokens=max_tokens)
-        if provider == "gemini" or self.model.startswith("gemini"):
-            return await self._call_gemini(system, user, max_tokens=max_tokens)
-        raise RuntimeError(
-            "No LLM client configured. Provide an Anthropic client, configure OpenRouter, or set LLM_PROVIDER=gemini with GEMINI_API_KEY.",
+        trace_ctx = self._langsmith_trace(
+            name=f"{self.agent_type}.llm_call",
+            run_type="llm",
+            inputs={"system": system, "user": user, "max_tokens": max_tokens, "provider": provider or "auto"},
+            tags=["llm", self.agent_type],
+            metadata={"model": self.model},
         )
+        with trace_ctx as llm_run:
+            try:
+                if self.client is not None and hasattr(self.client, "messages"):
+                    resp = await self.client.messages.create(
+                        model=self.model,
+                        max_tokens=max_tokens,
+                        system=system,
+                        messages=[{"role":"user","content":user}],
+                    )
+                    t = resp.content[0].text
+                    i = resp.usage.input_tokens
+                    o = resp.usage.output_tokens
+                    result = (t, i, o, round(i/1e6*3.0 + o/1e6*15.0, 6))
+                elif self._should_use_openrouter(provider):
+                    result = await self._call_openrouter(system, user, max_tokens=max_tokens)
+                elif provider == "gemini" or self.model.startswith("gemini"):
+                    result = await self._call_gemini(system, user, max_tokens=max_tokens)
+                else:
+                    raise RuntimeError(
+                        "No LLM client configured. Provide an Anthropic client, configure OpenRouter, or set LLM_PROVIDER=gemini with GEMINI_API_KEY.",
+                    )
+                if llm_run is not None:
+                    content, tokens_in, tokens_out, cost = result
+                    llm_run.add_outputs(
+                        {
+                            "content_preview": content[:200],
+                            "tokens_in": tokens_in,
+                            "tokens_out": tokens_out,
+                            "cost_usd": cost,
+                        }
+                    )
+                return result
+            except Exception as exc:
+                if llm_run is not None:
+                    llm_run.error = f"{type(exc).__name__}: {exc}"
+                raise
 
     @staticmethod
     def _should_use_openrouter(provider: str) -> bool:
@@ -359,6 +447,68 @@ class BaseApexAgent(ABC):
 
     @staticmethod
     def _sha(d): return hashlib.sha256(json.dumps(str(d),sort_keys=True).encode()).hexdigest()[:16]
+
+    def _langsmith_enabled(self) -> bool:
+        if not LANGSMITH_AVAILABLE:
+            return False
+        api_key = (os.environ.get("LANGSMITH_API_KEY") or "").strip()
+        tracing_flag = (os.environ.get("LANGCHAIN_TRACING_V2") or "").strip().lower()
+        return bool(api_key) and tracing_flag not in {"", "0", "false", "no", "off"}
+
+    def _get_langsmith_client(self):
+        if not self._langsmith_enabled():
+            return None
+        if self._langsmith_client is None:
+            self._langsmith_client = LangSmithClient(
+                api_key=os.environ.get("LANGSMITH_API_KEY"),
+                api_url=os.environ.get("LANGCHAIN_ENDPOINT") or None,
+            )
+        return self._langsmith_client
+
+    def _langsmith_project(self) -> str | None:
+        return (os.environ.get("LANGCHAIN_PROJECT") or "apex-ledger").strip() or "apex-ledger"
+
+    def _langsmith_trace(self, *, name: str, run_type: str, inputs: dict | None = None, tags: list[str] | None = None, metadata: dict | None = None):
+        if not self._langsmith_enabled():
+            return nullcontext(None)
+        try:
+            return langsmith_trace(
+                name=name,
+                run_type=run_type,
+                inputs=inputs,
+                project_name=self._langsmith_project(),
+                parent=self._langsmith_root_run,
+                tags=tags,
+                metadata=metadata,
+                client=self._get_langsmith_client(),
+            )
+        except Exception:
+            return nullcontext(None)
+
+    def _record_langsmith_span(
+        self,
+        *,
+        name: str,
+        run_type: str,
+        inputs: dict | None = None,
+        outputs: dict | None = None,
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        trace_ctx = self._langsmith_trace(
+            name=name,
+            run_type=run_type,
+            inputs=inputs,
+            tags=tags,
+            metadata=metadata,
+        )
+        try:
+            with trace_ctx as run:
+                if run is not None and outputs is not None:
+                    run.add_outputs(outputs)
+        except Exception:
+            # Tracing must never break the agent pipeline.
+            return
 
     @staticmethod
     async def reconstruct_agent_context(store, session_stream: str) -> dict:
