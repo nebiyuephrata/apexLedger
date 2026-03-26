@@ -106,6 +106,23 @@ async def test_state_reconstruction_load():
     assert agg.requested_amount_usd == 100000.0
 
 
+@pytest.mark.asyncio
+async def test_multiple_document_uploads_replay_in_documents_uploaded_state():
+    app_id = f"APEX-{uuid4().hex[:6]}"
+    store = InMemoryStore({
+        f"loan-{app_id}": [
+            _app_submitted(app_id),
+            {"event_type": "DocumentUploadRequested", "payload": {"application_id": app_id}},
+            {"event_type": "DocumentUploaded", "payload": {"application_id": app_id, "document_id": "doc-1", "document_type": "application_proposal"}},
+            {"event_type": "DocumentUploaded", "payload": {"application_id": app_id, "document_id": "doc-2", "document_type": "income_statement"}},
+            {"event_type": "DocumentUploaded", "payload": {"application_id": app_id, "document_id": "doc-3", "document_type": "balance_sheet"}},
+        ]
+    })
+    agg = await LoanApplicationAggregate.load(store, app_id)
+    assert agg.state == ApplicationState.DOCUMENTS_UPLOADED
+    assert set(agg.documents) == {"doc-1", "doc-2", "doc-3"}
+
+
 def test_state_machine_invalid_transition_raises():
     agg = LoanApplicationAggregate(application_id="APEX-INV")
     agg.state = ApplicationState.APPROVED

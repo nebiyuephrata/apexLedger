@@ -82,7 +82,10 @@ class LoanApplicationAggregate:
         p = event.get("payload", {})
         target = self._target_state_for_event(et, p)
         if target is not None:
-            self.assert_valid_transition(target)
+            # Multiple DocumentUploaded events are valid while the loan remains
+            # in DOCUMENTS_UPLOADED; each upload adds more package material.
+            if not (et == "DocumentUploaded" and target == self.state == ApplicationState.DOCUMENTS_UPLOADED):
+                self.assert_valid_transition(target)
         handler = getattr(self, f"_on_{et}", None)
         if handler:
             handler(p)

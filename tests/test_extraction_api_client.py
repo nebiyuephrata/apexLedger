@@ -114,6 +114,141 @@ async def test_extraction_api_client_uses_ingest_and_structured_query(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_extraction_api_client_falls_back_to_text_blocks_when_structured_query_is_empty(monkeypatch, tmp_path):
+    client = DocumentExtractionApiClient(base_url="http://127.0.0.1:8000")
+    source = tmp_path / "income_statement.pdf"
+    source.write_bytes(b"%PDF-1.4 mock")
+
+    def fake_urlopen(request, timeout):
+        if request.full_url.endswith("/ingest/file"):
+            return FakeHttpResponse(
+                {
+                    "trace_id": "ingest-456",
+                    "extraction": {
+                        "document_id": "doc-456",
+                        "strategy_used": "fast_text",
+                        "review_required": False,
+                        "extracted_document": {
+                            "text_blocks": [
+                                {
+                                    "content": "Revenue",
+                                    "bounding_box": {"x0": 10, "y0": 100, "x1": 40, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "$6,376,032",
+                                    "bounding_box": {"x0": 200, "y0": 100, "x1": 260, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Net",
+                                    "bounding_box": {"x0": 10, "y0": 120, "x1": 30, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Income",
+                                    "bounding_box": {"x0": 35, "y0": 120, "x1": 80, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "$120,142",
+                                    "bounding_box": {"x0": 200, "y0": 120, "x1": 250, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                            ],
+                            "tables": [],
+                        },
+                    },
+                }
+            )
+        return FakeHttpResponse({"document_id": "doc-456", "query": "unused", "rows": [], "audit": []})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    facts = await client.extract_financial_facts(
+        file_path=str(source),
+        document_kind="income_statement",
+        application_id="APP-456",
+    )
+
+    assert facts["total_revenue"] == 6376032.0
+    assert facts["net_income"] == 120142.0
+    assert facts["field_confidence"]["total_revenue"] == 0.65
+    assert facts["page_references"]["net_income"] == "page:1"
+    assert any("derived from text blocks" in note for note in facts["extraction_notes"])
+
+
+@pytest.mark.asyncio
+async def test_extraction_api_client_prefers_best_text_block_match(monkeypatch, tmp_path):
+    client = DocumentExtractionApiClient(base_url="http://127.0.0.1:8000")
+    source = tmp_path / "balance_sheet.pdf"
+    source.write_bytes(b"%PDF-1.4 mock")
+
+    def fake_urlopen(request, timeout):
+        if request.full_url.endswith("/ingest/file"):
+            return FakeHttpResponse(
+                {
+                    "trace_id": "ingest-789",
+                    "extraction": {
+                        "document_id": "doc-789",
+                        "strategy_used": "plain_text",
+                        "review_required": False,
+                        "extracted_document": {
+                            "text_blocks": [
+                                {
+                                    "content": "Total",
+                                    "bounding_box": {"x0": 10, "y0": 100, "x1": 40, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Current",
+                                    "bounding_box": {"x0": 45, "y0": 100, "x1": 90, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Assets",
+                                    "bounding_box": {"x0": 95, "y0": 100, "x1": 140, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "$5,350,573",
+                                    "bounding_box": {"x0": 200, "y0": 100, "x1": 260, "y1": 110},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Total",
+                                    "bounding_box": {"x0": 10, "y0": 120, "x1": 40, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "Assets",
+                                    "bounding_box": {"x0": 45, "y0": 120, "x1": 90, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                                {
+                                    "content": "$14,965,437",
+                                    "bounding_box": {"x0": 200, "y0": 120, "x1": 270, "y1": 130},
+                                    "page_refs": [{"page_start": 1, "page_end": 1}],
+                                },
+                            ],
+                            "tables": [],
+                        },
+                    },
+                }
+            )
+        return FakeHttpResponse({"document_id": "doc-789", "query": "unused", "rows": [], "audit": []})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    facts = await client.extract_financial_facts(
+        file_path=str(source),
+        document_kind="balance_sheet",
+        application_id="APP-789",
+    )
+
+    assert facts["total_assets"] == 14965437.0
+    assert facts["current_assets"] == 5350573.0
+
+
+@pytest.mark.asyncio
 async def test_extraction_api_client_raises_if_ingest_response_has_no_document_id(monkeypatch, tmp_path):
     client = DocumentExtractionApiClient(base_url="http://127.0.0.1:8000")
     source = tmp_path / "balance_sheet.pdf"
