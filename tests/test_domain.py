@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate, ApplicationState
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
+from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
+from ledger.domain.aggregates.audit_ledger import AuditLedgerAggregate
 from ledger.domain.errors import DomainError
 from ledger.commands.handlers import (
     handle_credit_analysis_completed,
@@ -104,6 +106,102 @@ async def test_state_reconstruction_load():
     assert agg.state == ApplicationState.APPROVED
     assert agg.applicant_id == "COMP-001"
     assert agg.requested_amount_usd == 100000.0
+
+
+@pytest.mark.asyncio
+async def test_compliance_record_reconstruction_load():
+    app_id = f"APEX-{uuid4().hex[:6]}"
+    store = InMemoryStore({
+        f"compliance-{app_id}": [
+            {
+                "event_type": "ComplianceCheckInitiated",
+                "payload": {
+                    "application_id": app_id,
+                    "session_id": "sess-comp",
+                    "regulation_set_version": "2026-Q1",
+                    "rules_to_evaluate": ["REG-001", "REG-002", "REG-003"],
+                    "initiated_at": datetime.now().isoformat(),
+                },
+            },
+            {
+                "event_type": "ComplianceRulePassed",
+                "payload": {
+                    "application_id": app_id,
+                    "session_id": "sess-comp",
+                    "rule_id": "REG-001",
+                    "rule_name": "BSA",
+                    "rule_version": "2026-Q1-v1",
+                    "evidence_hash": "h1",
+                    "evaluation_notes": "ok",
+                    "evaluated_at": datetime.now().isoformat(),
+                },
+            },
+            {
+                "event_type": "ComplianceRuleFailed",
+                "payload": {
+                    "application_id": app_id,
+                    "session_id": "sess-comp",
+                    "rule_id": "REG-003",
+                    "rule_name": "Jurisdiction Eligibility",
+                    "rule_version": "2026-Q1-v1",
+                    "failure_reason": "MT",
+                    "is_hard_block": True,
+                    "remediation_available": False,
+                    "evidence_hash": "h2",
+                    "evaluated_at": datetime.now().isoformat(),
+                },
+            },
+            {
+                "event_type": "ComplianceCheckCompleted",
+                "payload": {
+                    "application_id": app_id,
+                    "session_id": "sess-comp",
+                    "rules_evaluated": 3,
+                    "rules_passed": 1,
+                    "rules_failed": 1,
+                    "rules_noted": 0,
+                    "has_hard_block": True,
+                    "overall_verdict": "BLOCKED",
+                    "completed_at": datetime.now().isoformat(),
+                },
+            },
+        ]
+    })
+    agg = await ComplianceRecordAggregate.load(store, app_id)
+    assert agg.application_id == app_id
+    assert agg.regulation_set_version == "2026-Q1"
+    assert "REG-001" in agg.passed_rules
+    assert agg.failed_rules["REG-003"]["failure_reason"] == "MT"
+    assert agg.has_hard_block is True
+    assert agg.overall_verdict == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_audit_ledger_reconstruction_load():
+    entity_id = f"APP-{uuid4().hex[:6]}"
+    store = InMemoryStore({
+        f"audit-{entity_id}": [
+            {
+                "event_type": "AuditIntegrityCheckRun",
+                "payload": {
+                    "entity_type": "application",
+                    "entity_id": entity_id,
+                    "check_timestamp": datetime.now().isoformat(),
+                    "events_verified_count": 12,
+                    "integrity_hash": "hash-2",
+                    "previous_hash": "hash-1",
+                    "chain_valid": True,
+                    "tamper_detected": False,
+                },
+            },
+        ]
+    })
+    agg = await AuditLedgerAggregate.load(store, entity_id)
+    assert agg.entity_id == entity_id
+    assert agg.entity_type == "application"
+    assert agg.checks_run == 1
+    assert agg.last_integrity_hash == "hash-2"
+    assert agg.previous_hash == "hash-1"
 
 
 @pytest.mark.asyncio
