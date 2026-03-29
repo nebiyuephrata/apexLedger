@@ -88,6 +88,7 @@ class PolicyEngine:
             "role": auth.role,
             "org_id": auth.org_id,
             "is_internal": auth.is_internal,
+            "identity_type": auth.identity_type,
             "auth_source": auth.auth_source,
             "display_name": auth.display_name,
             "permissions": sorted(auth.permissions),
@@ -95,6 +96,7 @@ class PolicyEngine:
             "allowed_resources": profile["resources"],
             "allowed_views": profile["views"],
             "capabilities": sorted({*profile["tools"], *profile["resources"], *profile["views"]}),
+            "session_mode": "service" if auth.identity_type == "service" else "interactive",
         }
 
     def actor_profiles(self) -> list[dict]:
@@ -110,11 +112,11 @@ class PolicyEngine:
         ]
 
     def ensure_tool_allowed(self, auth: AuthContext, tool_name: str) -> None:
-        if tool_name not in self.actor_profile(auth.role)["tools"] and not auth.is_internal:
+        if tool_name not in self.actor_profile(auth.role)["tools"]:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Role {auth.role} cannot invoke tool {tool_name}")
 
     def ensure_view_allowed(self, auth: AuthContext, view_name: str) -> None:
-        if view_name not in self.actor_profile(auth.role)["views"] and not auth.is_internal:
+        if view_name not in self.actor_profile(auth.role)["views"]:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Role {auth.role} cannot access view {view_name}")
 
     def ensure_logs_allowed(self, auth: AuthContext) -> None:
@@ -122,15 +124,30 @@ class PolicyEngine:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Logs are restricted to admin/security roles")
 
     def ensure_same_org(self, auth: AuthContext, record: ApplicationAccessRecord) -> None:
-        if auth.is_internal:
-            return
         if record.tenant_id and auth.org_id and record.tenant_id != auth.org_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-tenant access denied")
+
+    def ensure_submit_allowed(self, auth: AuthContext, tenant_id: str | None, owner_user_id: str | None) -> None:
+        if auth.role not in {"loan_officer", "admin", "applicant", "user_proxy"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Role {auth.role} cannot create applications")
+        if auth.org_id and tenant_id and tenant_id != auth.org_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Applications must be created inside the caller organization")
+        if auth.role == "applicant" and owner_user_id and owner_user_id != auth.user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Applicants can only create applications they own")
 
     def ensure_application_visible(self, auth: AuthContext, record: ApplicationAccessRecord) -> None:
         self.ensure_same_org(auth, record)
         if auth.role == "applicant" and record.owner_user_id and record.owner_user_id != auth.user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Applicants can only access their own applications")
+
+    def ensure_application_mutation_allowed(self, auth: AuthContext, record: ApplicationAccessRecord) -> None:
+        self.ensure_application_visible(auth, record)
+        if auth.role == "auditor":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Auditors have read-only access")
+        if auth.role == "security_officer":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Security officers cannot mutate loan applications")
+        if auth.role == "applicant":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Applicants cannot run privileged workflow commands")
 
     def filter_applications(self, auth: AuthContext, rows: Iterable[dict]) -> list[dict]:
         visible: list[dict] = []

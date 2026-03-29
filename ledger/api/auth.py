@@ -17,6 +17,7 @@ class AuthContext:
     email: str | None = None
     display_name: str | None = None
     is_internal: bool = False
+    identity_type: str = "human"
     permissions: set[str] = field(default_factory=set)
     auth_source: str = "dev"
 
@@ -61,7 +62,7 @@ async def resolve_auth_context(
     x_ledger_dev_email: str | None = Header(default=None),
     x_ledger_dev_name: str | None = Header(default=None),
 ) -> AuthContext:
-    allow_dev = _boolish(os.environ.get("LEDGER_ALLOW_DEV_AUTH"), default=True)
+    allow_dev = _boolish(os.environ.get("LEDGER_ALLOW_DEV_AUTH"), default=False)
     if allow_dev and x_ledger_dev_role:
         return AuthContext(
             user_id=x_ledger_dev_user_id or f"dev-{x_ledger_dev_role}",
@@ -70,6 +71,7 @@ async def resolve_auth_context(
             email=x_ledger_dev_email,
             display_name=x_ledger_dev_name or x_ledger_dev_role.replace("_", " ").title(),
             is_internal=_boolish(x_ledger_dev_internal, default=x_ledger_dev_role in {"admin", "security_officer", "auditor"}),
+            identity_type="service" if _boolish(x_ledger_dev_internal, default=False) else "human",
             auth_source="dev",
         )
 
@@ -84,6 +86,8 @@ async def resolve_auth_context(
 
     public_meta = claims.get("public_metadata") or {}
     unsafe_meta = claims.get("unsafe_metadata") or {}
+    if not _verifier.issuer or not _verifier.jwks_url:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Clerk verifier is not configured for production use")
     role = (
         claims.get("role")
         or claims.get("org_role")
@@ -92,9 +96,21 @@ async def resolve_auth_context(
         or "loan_officer"
     )
     org_id = claims.get("org_id") or claims.get("organization_id") or public_meta.get("org_id") or unsafe_meta.get("org_id")
+    org_membership = claims.get("org_membership") or public_meta.get("org_membership") or unsafe_meta.get("org_membership")
     perms = claims.get("permissions") or public_meta.get("permissions") or unsafe_meta.get("permissions") or []
     if isinstance(perms, str):
         perms = [perms]
+    permissions = {str(p) for p in perms}
+    identity_type = str(
+        claims.get("actor_type")
+        or public_meta.get("actor_type")
+        or unsafe_meta.get("actor_type")
+        or ("service" if "svc:browser_api" in permissions or "svc:internal_automation" in permissions else "human")
+    )
+    if role != "admin" and not org_id and identity_type != "service":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authenticated user is missing organization membership")
+    if org_membership is False:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Authenticated user is not an active member of the requested organization")
 
     return AuthContext(
         user_id=str(claims.get("sub") or claims.get("user_id") or "unknown"),
@@ -102,7 +118,8 @@ async def resolve_auth_context(
         org_id=str(org_id) if org_id else None,
         email=claims.get("email") or public_meta.get("email"),
         display_name=claims.get("name") or claims.get("preferred_username"),
-        is_internal=_boolish(str(claims.get("is_internal", "false")), default=str(role) in {"admin", "security_officer", "auditor"}),
-        permissions={str(p) for p in perms},
+        is_internal=identity_type == "service",
+        identity_type=identity_type,
+        permissions=permissions,
         auth_source="clerk",
     )

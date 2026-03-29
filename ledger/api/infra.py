@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import Any, Awaitable, Callable
+
+from .contracts import RouteMetricSnapshot
 
 try:
     from redis import asyncio as redis_async
@@ -14,11 +17,55 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
 @dataclass
 class IdempotencyRecord:
     fingerprint: str
     response: dict
     status_code: int
+
+
+@dataclass
+class RuntimeMetrics:
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_invalidations: int = 0
+    db_queries: int = 0
+    db_total_latency_ms: int = 0
+    action_logs: list[dict[str, Any]] = field(default_factory=list)
+    route_metrics: dict[str, RouteMetricSnapshot] = field(default_factory=dict)
+
+    def record_cache(self, hit: bool) -> None:
+        if hit:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+
+    def record_db_query(self, latency_ms: int) -> None:
+        self.db_queries += 1
+        self.db_total_latency_ms += latency_ms
+
+    def record_route(self, route_name: str, latency_ms: int) -> None:
+        snapshot = self.route_metrics.setdefault(route_name, RouteMetricSnapshot())
+        snapshot.add(latency_ms)
+
+    def record_action(self, entry: dict[str, Any]) -> None:
+        self.action_logs.append(entry)
+        if len(self.action_logs) > 200:
+            self.action_logs = self.action_logs[-200:]
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_invalidations": self.cache_invalidations,
+            "db_queries": self.db_queries,
+            "avg_db_latency_ms": int(self.db_total_latency_ms / self.db_queries) if self.db_queries else 0,
+            "routes": {name: metric.summary() for name, metric in self.route_metrics.items()},
+            "recent_actions": self.action_logs[-20:],
+        }
 
 
 class InMemoryInfraStore:
@@ -88,6 +135,7 @@ class RedisInfraStore:
 
 
 _store: InMemoryInfraStore | RedisInfraStore | None = None
+metrics = RuntimeMetrics()
 
 
 def get_infra_store() -> InMemoryInfraStore | RedisInfraStore:
@@ -114,7 +162,9 @@ async def get_cached_or_load(key: str, ttl_seconds: int, loader: Callable[[], Aw
     store = get_infra_store()
     cached = await store.get_json(key)
     if cached is not None:
+        metrics.record_cache(hit=True)
         return cached
+    metrics.record_cache(hit=False)
     value = await loader()
     await store.set_json(key, value, ttl_seconds=ttl_seconds)
     return value
@@ -155,4 +205,21 @@ async def save_idempotency_record(key: str, fingerprint: str, response: dict, st
 async def invalidate_patterns(*patterns: str) -> None:
     store = get_infra_store()
     for pattern in patterns:
+        metrics.cache_invalidations += 1
         await store.delete_pattern(pattern)
+
+
+def record_db_query(latency_ms: int) -> None:
+    metrics.record_db_query(latency_ms)
+
+
+def record_route_latency(route_name: str, latency_ms: int) -> None:
+    metrics.record_route(route_name, latency_ms)
+
+
+def record_action(entry: dict[str, Any]) -> None:
+    metrics.record_action(entry)
+
+
+def runtime_snapshot() -> dict[str, Any]:
+    return metrics.snapshot()
