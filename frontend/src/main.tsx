@@ -8,6 +8,7 @@ import App from './App';
 import { authProvider } from './auth/AuthProvider';
 import { theme } from './theme';
 import { queryClient } from './platform/queryClient';
+import { AppErrorBoundary } from './components/AppErrorBoundary';
 import './index.css';
 
 const Root = authProvider(({ children }) => (
@@ -21,9 +22,11 @@ const Root = authProvider(({ children }) => (
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <Root>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
+      <AppErrorBoundary>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </AppErrorBoundary>
     </Root>
   </React.StrictMode>
 );

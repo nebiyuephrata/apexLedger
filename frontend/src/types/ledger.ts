@@ -61,6 +61,36 @@ export type ProjectionHealth = {
   >;
 };
 
+export type ApiErrorPayload = {
+  error_type: string;
+  message: string;
+  context: Record<string, unknown>;
+  suggested_action?: string | null;
+  request_id?: string | null;
+};
+
+export type ApiMeta = {
+  request_id: string;
+  idempotency_key?: string | null;
+  idempotent_replay?: boolean;
+  latency_ms?: number | null;
+};
+
+export type ApiEnvelope<T> = {
+  ok: boolean;
+  result: T | null;
+  error: ApiErrorPayload | null;
+  meta: ApiMeta | null;
+};
+
+export type PaginatedResult<T> = {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
+};
+
 export type AgentSessionStatus = {
   session_id: string;
   agent_type: string;
@@ -82,6 +112,12 @@ export type ActivityLog = {
   component: string;
   message: string;
   timestamp: string;
+  actor?: string;
+  org_id?: string | null;
+  request_id?: string;
+  idempotency_key?: string | null;
+  latency_ms?: number;
+  result?: string;
 };
 
 export type ActorProfile = {
@@ -97,6 +133,7 @@ export type SessionContext = {
   role: Role;
   org_id: string | null;
   is_internal: boolean;
+  identity_type?: string;
   auth_source: string;
   display_name?: string | null;
   permissions: string[];
@@ -104,4 +141,22 @@ export type SessionContext = {
   allowed_resources: string[];
   allowed_views: string[];
   capabilities: string[];
+  session_mode?: string;
+  support_flags?: {
+    dev_auth_enabled?: boolean;
+  };
+};
+
+export type ToolExecutionResult = {
+  [key: string]: unknown;
+};
+
+export type RuntimeSnapshot = {
+  cache_hits: number;
+  cache_misses: number;
+  cache_invalidations: number;
+  db_queries: number;
+  avg_db_latency_ms: number;
+  routes: Record<string, { count: number; p50_ms: number; p95_ms: number; p99_ms: number }>;
+  recent_actions: ActivityLog[];
 };

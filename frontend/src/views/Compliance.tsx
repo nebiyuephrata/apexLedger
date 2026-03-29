@@ -8,8 +8,9 @@ export const Compliance: React.FC = () => {
   const [applicationId, setApplicationId] = React.useState('loan-ACME-0091');
   const [asOf, setAsOf] = React.useState('2026-03-25T09:10');
   const { data: snapshot = null, refetch: refetchSnapshot } = useComplianceQuery(applicationId, asOf);
-  const { data: audit = [], refetch: refetchAudit } = useAuditTrailQuery(applicationId);
+  const { data: auditPage, refetch: refetchAudit } = useAuditTrailQuery(applicationId);
   const invokeTool = useInvokeToolMutation();
+  const audit = auditPage?.items ?? [];
   const loadView = React.useCallback(async () => {
     await Promise.all([refetchSnapshot(), refetchAudit()]);
   }, [refetchAudit, refetchSnapshot]);

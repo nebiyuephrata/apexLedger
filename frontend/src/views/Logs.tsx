@@ -15,7 +15,8 @@ export const Logs: React.FC = () => {
   const [componentFilter, setComponentFilter] = React.useState('');
   const deferredQuery = useDeferredValue(query);
   const deferredComponent = useDeferredValue(componentFilter);
-  const { data: logs = [] } = useLogsQuery(75);
+  const { data: logsPage } = useLogsQuery({ pageSize: 75, search: deferredQuery });
+  const logs = logsPage?.items ?? [];
 
   const filteredLogs = React.useMemo(() => {
     return logs.filter((entry) => {

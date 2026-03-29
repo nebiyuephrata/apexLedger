@@ -3,16 +3,17 @@ import { ledgerClient } from '../../lib/ledgerClient';
 
 export const ledgerKeys = {
   session: ['session'] as const,
-  applications: ['applications'] as const,
+  applications: (params?: { page?: number; pageSize?: number; search?: string; state?: string }) => ['applications', params ?? {}] as const,
   application: (applicationId: string) => ['application', applicationId] as const,
   compliance: (applicationId: string, asOf?: string) => ['compliance', applicationId, asOf ?? 'current'] as const,
-  audit: (applicationId: string) => ['audit', applicationId] as const,
+  audit: (applicationId: string, params?: { page?: number; pageSize?: number; eventType?: string }) => ['audit', applicationId, params ?? {}] as const,
   health: ['health'] as const,
   commands: ['commands'] as const,
   actors: ['actors'] as const,
-  sessions: ['agent-sessions'] as const,
+  sessions: (params?: { page?: number; pageSize?: number; agentType?: string }) => ['agent-sessions', params ?? {}] as const,
   agentPerformance: (agentType?: string) => ['agent-performance', agentType ?? 'default'] as const,
-  logs: (limit = 50) => ['logs', limit] as const,
+  logs: (params?: { page?: number; pageSize?: number; level?: string; search?: string }) => ['logs', params ?? {}] as const,
+  runtime: ['runtime'] as const,
 };
 
 export const useSessionQuery = () =>
@@ -22,10 +23,10 @@ export const useSessionQuery = () =>
     staleTime: 15_000,
   });
 
-export const useApplicationsQuery = () =>
+export const useApplicationsQuery = (params?: { page?: number; pageSize?: number; search?: string; state?: string }) =>
   useQuery({
-    queryKey: ledgerKeys.applications,
-    queryFn: () => ledgerClient.getApplicationSummaries(),
+    queryKey: ledgerKeys.applications(params),
+    queryFn: () => ledgerClient.getApplicationSummaries(params),
     staleTime: 5_000,
   });
 
@@ -45,10 +46,10 @@ export const useComplianceQuery = (applicationId: string, asOf?: string) =>
     staleTime: 15_000,
   });
 
-export const useAuditTrailQuery = (applicationId: string) =>
+export const useAuditTrailQuery = (applicationId: string, params?: { page?: number; pageSize?: number; eventType?: string }) =>
   useQuery({
-    queryKey: ledgerKeys.audit(applicationId),
-    queryFn: () => ledgerClient.getAuditTrail(applicationId),
+    queryKey: ledgerKeys.audit(applicationId, params),
+    queryFn: () => ledgerClient.getAuditTrail(applicationId, params),
     enabled: Boolean(applicationId),
     staleTime: 10_000,
   });
@@ -75,10 +76,10 @@ export const useActorProfilesQuery = () =>
     staleTime: 60_000,
   });
 
-export const useAgentSessionsQuery = () =>
+export const useAgentSessionsQuery = (params?: { page?: number; pageSize?: number; agentType?: string }) =>
   useQuery({
-    queryKey: ledgerKeys.sessions,
-    queryFn: () => ledgerClient.getAgentSessions(),
+    queryKey: ledgerKeys.sessions(params),
+    queryFn: () => ledgerClient.getAgentSessions(params),
     staleTime: 5_000,
     refetchInterval: 10_000,
   });
@@ -90,11 +91,19 @@ export const useAgentPerformanceQuery = (agentType?: string) =>
     staleTime: 10_000,
   });
 
-export const useLogsQuery = (limit = 50) =>
+export const useLogsQuery = (params?: { page?: number; pageSize?: number; level?: string; search?: string }) =>
   useQuery({
-    queryKey: ledgerKeys.logs(limit),
-    queryFn: () => ledgerClient.getLogs(limit),
+    queryKey: ledgerKeys.logs(params),
+    queryFn: () => ledgerClient.getLogs(params),
     staleTime: 3_000,
+    refetchInterval: 10_000,
+  });
+
+export const useRuntimeQuery = () =>
+  useQuery({
+    queryKey: ledgerKeys.runtime,
+    queryFn: () => ledgerClient.getRuntime(),
+    staleTime: 5_000,
     refetchInterval: 10_000,
   });
 
@@ -106,10 +115,11 @@ export const useInvokeToolMutation = () => {
       ledgerClient.invokeTool(toolName, payload, idempotencyKey),
     onSuccess: async () => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ledgerKeys.applications }),
+        queryClient.invalidateQueries({ queryKey: ['applications'] }),
         queryClient.invalidateQueries({ queryKey: ledgerKeys.health }),
-        queryClient.invalidateQueries({ queryKey: ledgerKeys.sessions }),
-        queryClient.invalidateQueries({ queryKey: ledgerKeys.logs() }),
+        queryClient.invalidateQueries({ queryKey: ['agent-sessions'] }),
+        queryClient.invalidateQueries({ queryKey: ['logs'] }),
+        queryClient.invalidateQueries({ queryKey: ledgerKeys.runtime }),
       ]);
     },
   });

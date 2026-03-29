@@ -4,7 +4,8 @@ import { SectionCard } from '../components/SectionCard';
 import { useAuditTrailQuery } from '../features/ledger/hooks';
 
 export const AuditTrail: React.FC = () => {
-  const { data: trail = [] } = useAuditTrailQuery('loan-ACME-0091');
+  const { data: trailPage } = useAuditTrailQuery('loan-ACME-0091');
+  const trail = trailPage?.items ?? [];
 
   return (
     <div className="space-y-6">

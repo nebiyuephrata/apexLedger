@@ -7,7 +7,8 @@ import { useAuditTrailQuery, useHealthQuery } from '../features/ledger/hooks';
 
 export const Security: React.FC = () => {
   const { data: health = null } = useHealthQuery();
-  const { data: audit = [] } = useAuditTrailQuery('loan-ACME-0091');
+  const { data: auditPage } = useAuditTrailQuery('loan-ACME-0091');
+  const audit = auditPage?.items ?? [];
 
   return (
     <div className="space-y-6">

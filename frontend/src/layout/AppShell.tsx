@@ -127,6 +127,11 @@ export const AppShell: React.FC<React.PropsWithChildren> = ({ children }) => {
           <Typography variant="body2" className="mt-2 text-slate-400">
             {profile?.focus ?? 'Resolving actor permissions and responsibilities.'}
           </Typography>
+          <div className="mt-3 grid gap-2 text-xs text-slate-400">
+            <div>Org: <span className="text-slate-200">{session?.org_id ?? 'unscoped'}</span></div>
+            <div>Mode: <span className="text-slate-200">{session?.session_mode ?? 'interactive'}</span></div>
+            <div>Identity: <span className="text-slate-200">{session?.identity_type ?? 'human'}</span></div>
+          </div>
         </div>
         <div className="space-y-2">
           <Typography variant="caption" className="text-slate-500">

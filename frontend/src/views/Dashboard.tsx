@@ -1,11 +1,12 @@
 import React from 'react';
-import { Button, Chip, Stack, Typography } from '@mui/material';
+import { Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Stack, TextField, Typography } from '@mui/material';
 import { DataGrid, GridColDef } from '@mui/x-data-grid';
 import toast from 'react-hot-toast';
 import { MetricCard } from '../components/MetricCard';
 import { SectionCard } from '../components/SectionCard';
 import { LagStatus } from '../components/LagStatus';
 import { useAgentSessionsQuery, useApplicationsQuery, useCommandCatalogQuery, useHealthQuery, useInvokeToolMutation } from '../features/ledger/hooks';
+import { LedgerApiError } from '../lib/ledgerClient';
 import {
   ApplicationSummary,
 } from '../types/ledger';
@@ -32,20 +33,109 @@ const columns: GridColDef<ApplicationSummary>[] = [
 
 export const Dashboard: React.FC = () => {
   const [selectedId, setSelectedId] = React.useState<string>('loan-ACME-0091');
-  const { data: applications = [] } = useApplicationsQuery();
+  const [newApplicationOpen, setNewApplicationOpen] = React.useState(false);
+  const [reviewOpen, setReviewOpen] = React.useState(false);
+  const [newApplication, setNewApplication] = React.useState({
+    application_id: '',
+    applicant_id: '',
+    requested_amount_usd: '100000',
+    loan_purpose: 'working_capital',
+  });
+  const [humanReview, setHumanReview] = React.useState({
+    reviewer_id: 'loan-officer-1',
+    final_decision: 'APPROVE',
+    approved_amount_usd: '50000',
+    interest_rate_pct: '5.0',
+    term_months: '24',
+    override_reason: '',
+  });
+  const { data: applicationsPage } = useApplicationsQuery();
   const { data: health = null } = useHealthQuery();
-  const { data: sessions = [] } = useAgentSessionsQuery();
+  const { data: sessionsPage } = useAgentSessionsQuery();
   const { data: commands = [] } = useCommandCatalogQuery();
   const invokeTool = useInvokeToolMutation();
+
+  const applications = applicationsPage?.items ?? [];
+  const sessions = sessionsPage?.items ?? [];
 
   const selected = applications.find((item) => item.application_id === selectedId) ?? applications[0] ?? null;
 
   const kpis = [
-    { label: 'Active Applications', value: String(applications.length || 0), helper: 'Projection-backed operational view' },
+    { label: 'Active Applications', value: String(applicationsPage?.total ?? applications.length ?? 0), helper: 'Projection-backed operational view' },
     { label: 'Pending Decision', value: String(applications.filter((item) => item.state === 'PENDING_DECISION').length), helper: 'Awaiting orchestration or human action' },
     { label: 'Hard Blocks', value: String(applications.filter((item) => item.compliance_status === 'BLOCKED').length), helper: 'Compliance-led auto declines' },
     { label: 'Live Sessions', value: String(sessions.filter((item) => item.status !== 'completed').length), helper: 'Gas Town session streams in-flight' },
   ];
+
+  const handleMutationError = (error: unknown) => {
+    if (error instanceof LedgerApiError) {
+      toast.error(`${error.message}${error.suggestedAction ? ` · ${error.suggestedAction}` : ''}`);
+      return;
+    }
+    toast.error(error instanceof Error ? error.message : 'Command failed');
+  };
+
+  const submitApplication = () => {
+    if (!newApplication.application_id || !newApplication.applicant_id) {
+      toast.error('Application ID and applicant ID are required.');
+      return;
+    }
+    invokeTool.mutate(
+      {
+        toolName: 'submit_application',
+        payload: {
+          application_id: newApplication.application_id,
+          applicant_id: newApplication.applicant_id,
+          requested_amount_usd: Number(newApplication.requested_amount_usd),
+          loan_purpose: newApplication.loan_purpose,
+        },
+      },
+      {
+        onSuccess: ({ meta }) => {
+          toast.success(
+            meta?.idempotent_replay
+              ? `Application replayed · ${meta.idempotency_key}`
+              : `Application submitted · ${meta?.request_id ?? 'request pending'}`,
+          );
+          setSelectedId(newApplication.application_id);
+          setNewApplicationOpen(false);
+        },
+        onError: handleMutationError,
+      },
+    );
+  };
+
+  const submitHumanReview = () => {
+    if (!selected) {
+      toast.error('Select an application first.');
+      return;
+    }
+    invokeTool.mutate(
+      {
+        toolName: 'record_human_review',
+        payload: {
+          application_id: selected.application_id,
+          reviewer_id: humanReview.reviewer_id,
+          final_decision: humanReview.final_decision,
+          approved_amount_usd: Number(humanReview.approved_amount_usd),
+          interest_rate_pct: Number(humanReview.interest_rate_pct),
+          term_months: Number(humanReview.term_months),
+          override_reason: humanReview.override_reason || undefined,
+        },
+      },
+      {
+        onSuccess: ({ meta }) => {
+          toast.success(
+            meta?.idempotent_replay
+              ? `Human review replayed · ${meta.idempotency_key}`
+              : `Human review recorded · ${meta?.request_id ?? 'request pending'}`,
+          );
+          setReviewOpen(false);
+        },
+        onError: handleMutationError,
+      },
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -71,7 +161,7 @@ export const Dashboard: React.FC = () => {
         <SectionCard
           title="Application Summary Projection"
           subtitle="Operational one-row-per-application dashboard powered by CQRS projections."
-          actions={<Button variant="contained" onClick={() => toast.success('submit_application staged')}>New Application</Button>}
+          actions={<Button variant="contained" onClick={() => setNewApplicationOpen(true)}>New Application</Button>}
         >
           <div className="h-[420px]">
             <DataGrid
@@ -142,13 +232,11 @@ export const Dashboard: React.FC = () => {
                 <Button
                   variant="contained"
                   color="success"
-                  onClick={() => toast('record_human_review will enforce override semantics', { icon: 'A' })}
+                  onClick={() => setReviewOpen(true)}
                 >
                   Approve with Guard
                 </Button>
-                <Button variant="outlined" color="inherit" onClick={() => toast.success('Human review requested')}>
-                  Request Review
-                </Button>
+                <Button variant="outlined" color="inherit" onClick={() => setReviewOpen(true)}>Request Review</Button>
               </Stack>
             </div>
           ) : (
@@ -207,12 +295,17 @@ export const Dashboard: React.FC = () => {
                     size="small"
                     variant="text"
                     color="secondary"
-                      onClick={() => {
+                    onClick={() => {
                       invokeTool.mutate(
                         { toolName: command.name },
                         {
-                          onSuccess: () => toast.success(`${command.name} sent`),
-                          onError: (error) => toast.error(error instanceof Error ? error.message : 'Command failed'),
+                          onSuccess: ({ meta }) =>
+                            toast.success(
+                              meta?.idempotent_replay
+                                ? `${command.name} replayed · ${meta.idempotency_key}`
+                                : `${command.name} sent · ${meta?.request_id ?? 'request pending'}`,
+                            ),
+                          onError: handleMutationError,
                         },
                       );
                     }}
@@ -231,6 +324,112 @@ export const Dashboard: React.FC = () => {
           </div>
         </SectionCard>
       </div>
+
+      <Dialog open={newApplicationOpen} onClose={() => setNewApplicationOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>New Application</DialogTitle>
+        <DialogContent className="space-y-4">
+          <TextField
+            margin="dense"
+            label="Application ID"
+            fullWidth
+            value={newApplication.application_id}
+            onChange={(event) => setNewApplication((current) => ({ ...current, application_id: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            label="Applicant ID"
+            fullWidth
+            value={newApplication.applicant_id}
+            onChange={(event) => setNewApplication((current) => ({ ...current, applicant_id: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            label="Requested Amount"
+            type="number"
+            fullWidth
+            value={newApplication.requested_amount_usd}
+            onChange={(event) => setNewApplication((current) => ({ ...current, requested_amount_usd: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            select
+            label="Loan Purpose"
+            fullWidth
+            value={newApplication.loan_purpose}
+            onChange={(event) => setNewApplication((current) => ({ ...current, loan_purpose: event.target.value }))}
+          >
+            <MenuItem value="working_capital">Working Capital</MenuItem>
+            <MenuItem value="equipment">Equipment</MenuItem>
+            <MenuItem value="expansion">Expansion</MenuItem>
+          </TextField>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setNewApplicationOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={submitApplication} disabled={invokeTool.isPending}>Submit</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={reviewOpen} onClose={() => setReviewOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Record Human Review</DialogTitle>
+        <DialogContent className="space-y-4">
+          <TextField
+            margin="dense"
+            label="Reviewer ID"
+            fullWidth
+            value={humanReview.reviewer_id}
+            onChange={(event) => setHumanReview((current) => ({ ...current, reviewer_id: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            select
+            label="Final Decision"
+            fullWidth
+            value={humanReview.final_decision}
+            onChange={(event) => setHumanReview((current) => ({ ...current, final_decision: event.target.value }))}
+          >
+            <MenuItem value="APPROVE">Approve</MenuItem>
+            <MenuItem value="DECLINE">Decline</MenuItem>
+            <MenuItem value="REFER">Refer</MenuItem>
+          </TextField>
+          <TextField
+            margin="dense"
+            label="Approved Amount"
+            type="number"
+            fullWidth
+            value={humanReview.approved_amount_usd}
+            onChange={(event) => setHumanReview((current) => ({ ...current, approved_amount_usd: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            label="Interest Rate %"
+            type="number"
+            fullWidth
+            value={humanReview.interest_rate_pct}
+            onChange={(event) => setHumanReview((current) => ({ ...current, interest_rate_pct: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            label="Term (Months)"
+            type="number"
+            fullWidth
+            value={humanReview.term_months}
+            onChange={(event) => setHumanReview((current) => ({ ...current, term_months: event.target.value }))}
+          />
+          <TextField
+            margin="dense"
+            label="Override Reason"
+            fullWidth
+            multiline
+            minRows={3}
+            value={humanReview.override_reason}
+            onChange={(event) => setHumanReview((current) => ({ ...current, override_reason: event.target.value }))}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setReviewOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={submitHumanReview} disabled={invokeTool.isPending}>Record Review</Button>
+        </DialogActions>
+      </Dialog>
     </div>
   );
 };

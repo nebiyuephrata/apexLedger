@@ -11,7 +11,8 @@ const currency = new Intl.NumberFormat('en-US', {
 });
 
 export const Applicant: React.FC = () => {
-  const { data: applications = [] } = useApplicationsQuery();
+  const { data: applicationsPage } = useApplicationsQuery();
+  const applications = applicationsPage?.items ?? [];
   const application = applications[0] ?? null;
 
   return (
