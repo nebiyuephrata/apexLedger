@@ -5,7 +5,7 @@ import toast from 'react-hot-toast';
 import { MetricCard } from '../components/MetricCard';
 import { SectionCard } from '../components/SectionCard';
 import { LagStatus } from '../components/LagStatus';
-import { useAgentSessionsQuery, useApplicationsQuery, useCommandCatalogQuery, useHealthQuery, useInvokeToolMutation } from '../features/ledger/hooks';
+import { useAgentInteractionsQuery, useAgentSessionsQuery, useApplicationsQuery, useCommandCatalogQuery, useHealthQuery, useInvokeToolMutation } from '../features/ledger/hooks';
 import { LedgerApiError } from '../lib/ledgerClient';
 import {
   ApplicationSummary,
@@ -35,6 +35,7 @@ export const Dashboard: React.FC = () => {
   const [selectedId, setSelectedId] = React.useState<string>('loan-ACME-0091');
   const [newApplicationOpen, setNewApplicationOpen] = React.useState(false);
   const [reviewOpen, setReviewOpen] = React.useState(false);
+  const [selectedAgentTool, setSelectedAgentTool] = React.useState('run_document_processing_agent');
   const [newApplication, setNewApplication] = React.useState({
     application_id: '',
     applicant_id: '',
@@ -52,11 +53,20 @@ export const Dashboard: React.FC = () => {
   const { data: applicationsPage } = useApplicationsQuery();
   const { data: health = null } = useHealthQuery();
   const { data: sessionsPage } = useAgentSessionsQuery();
+  const { data: interactions = [] } = useAgentInteractionsQuery({
+    applicationId: selectedId || applicationsPage?.items?.[0]?.application_id || '',
+    agentType: selectedAgentTool.replace(/^run_/, '').replace(/_agent$/, ''),
+    limit: 12,
+  });
   const { data: commands = [] } = useCommandCatalogQuery();
   const invokeTool = useInvokeToolMutation();
 
   const applications = applicationsPage?.items ?? [];
   const sessions = sessionsPage?.items ?? [];
+  const agentTools = React.useMemo(
+    () => commands.filter((command) => command.name.startsWith('run_') && command.name.endsWith('_agent')),
+    [commands],
+  );
 
   const selected = applications.find((item) => item.application_id === selectedId) ?? applications[0] ?? null;
 
@@ -283,10 +293,78 @@ export const Dashboard: React.FC = () => {
         </SectionCard>
 
         <SectionCard
-          title="Command Surface"
-          subtitle="These are the actual MCP tools exposed in the repo, with their preconditions visible to keep command behavior explicit."
+          title="Agent Command Surface"
+          subtitle="Run agents directly, inspect live interactions, and keep execution grounded in the actual MCP tools."
         >
           <div className="space-y-3">
+            <TextField
+              select
+              label="Agent"
+              value={selectedAgentTool}
+              onChange={(event) => setSelectedAgentTool(event.target.value)}
+              fullWidth
+            >
+              {agentTools.map((command) => (
+                <MenuItem key={command.name} value={command.name}>
+                  {command.name}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            <Button
+              variant="contained"
+              fullWidth
+              disabled={!selected}
+              onClick={() => {
+                if (!selected) {
+                  toast.error('Select an application first.');
+                  return;
+                }
+                invokeTool.mutate(
+                  { toolName: selectedAgentTool, payload: { application_id: selected.application_id } },
+                  {
+                    onSuccess: ({ meta }) =>
+                      toast.success(
+                        meta?.idempotent_replay
+                          ? `${selectedAgentTool} replayed · ${meta.idempotency_key}`
+                          : `${selectedAgentTool} started · ${meta?.request_id ?? 'request pending'}`,
+                      ),
+                    onError: handleMutationError,
+                  },
+                );
+              }}
+            >
+              Run Selected Agent
+            </Button>
+
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <Typography variant="subtitle2">Live Agent Interaction</Typography>
+              <Typography variant="caption" className="mt-1 block text-slate-500">
+                Polling recent agent session events for the selected application.
+              </Typography>
+              <div className="mt-3 space-y-3">
+                {interactions.map((interaction) => (
+                  <div key={`${interaction.stream_id}-${interaction.global_position ?? interaction.timestamp}`} className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <Typography variant="subtitle2">{interaction.event_type}</Typography>
+                      <Chip label={interaction.agent_type} size="small" variant="outlined" />
+                    </div>
+                    <Typography variant="caption" className="mt-1 block text-slate-500">
+                      {interaction.timestamp ?? 'pending'} · {interaction.session_id}
+                    </Typography>
+                    <Typography variant="body2" className="mt-2 text-slate-300">
+                      {interaction.summary}
+                    </Typography>
+                  </div>
+                ))}
+                {interactions.length === 0 ? (
+                  <Typography variant="body2" className="text-slate-400">
+                    No live interaction events yet for this application and agent.
+                  </Typography>
+                ) : null}
+              </div>
+            </div>
+
             {commands.map((command) => (
               <div key={command.name} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">

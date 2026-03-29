@@ -20,85 +20,79 @@ export type AuthUser = {
   isInternal?: boolean;
 };
 
+type LocalSignInPayload = {
+  role: Role;
+  password: string;
+  orgId?: string;
+};
+
 type AuthContextValue = {
   user: AuthUser | null;
   setRole: (role: Role) => void;
+  signIn?: (payload: LocalSignInPayload) => Promise<void>;
   signOut?: () => void;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-const mockUsers: AuthUser[] = [
-  {
-    id: 'u-loan-01',
-    name: 'Amina Solomon',
-    email: 'amina@ledger.local',
-    role: 'loan_officer'
-  },
-  {
-    id: 'u-comp-01',
-    name: 'Jonas Okoro',
-    email: 'jonas@ledger.local',
-    role: 'compliance_officer'
-  },
-  {
-    id: 'u-sec-01',
-    name: 'Rhea Patel',
-    email: 'rhea@ledger.local',
-    role: 'security_officer'
-  },
-  {
-    id: 'u-admin-01',
-    name: 'Diego Chan',
-    email: 'diego@ledger.local',
-    role: 'admin'
-  },
-  {
-    id: 'u-audit-01',
-    name: 'Nia Bekele',
-    email: 'nia@ledger.local',
-    role: 'auditor'
-  },
-  {
-    id: 'u-app-01',
-    name: 'ACME Applicant',
-    email: 'finance@acme.local',
-    role: 'applicant'
-  },
-  {
-    id: 'u-proxy-01',
-    name: 'UserProxy',
-    email: 'proxy@ledger.local',
-    role: 'user_proxy'
-  }
-];
+const localUsers: Record<Role, AuthUser> = {
+  loan_officer: { id: 'u-loan-01', name: 'Amina Solomon', email: 'amina@ledger.local', role: 'loan_officer' },
+  compliance_officer: { id: 'u-comp-01', name: 'Jonas Okoro', email: 'jonas@ledger.local', role: 'compliance_officer' },
+  security_officer: { id: 'u-sec-01', name: 'Rhea Patel', email: 'rhea@ledger.local', role: 'security_officer', isInternal: true },
+  admin: { id: 'u-admin-01', name: 'Diego Chan', email: 'diego@ledger.local', role: 'admin', isInternal: true },
+  auditor: { id: 'u-audit-01', name: 'Nia Bekele', email: 'nia@ledger.local', role: 'auditor', isInternal: true },
+  applicant: { id: 'u-app-01', name: 'ACME Applicant', email: 'finance@acme.local', role: 'applicant' },
+  user_proxy: { id: 'u-proxy-01', name: 'UserProxy', email: 'proxy@ledger.local', role: 'user_proxy', isInternal: true },
+};
 
-const MockAuthProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
-  const [role, setRole] = useState<Role>('loan_officer');
+const DEV_SESSION_KEY = 'ledger-dev-session';
 
-  const user = useMemo(() => {
-    const selected = mockUsers.find((entry) => entry.role === role) ?? mockUsers[0];
-    return {
-      ...selected,
-      role,
-      orgId: import.meta.env.VITE_LEDGER_DEV_ORG_ID ?? 'org_demo',
-      isInternal: import.meta.env.VITE_LEDGER_DEV_INTERNAL === 'true',
-    };
-  }, [role]);
+const DevAuthProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
+  const [user, setUser] = useState<AuthUser | null>(() => {
+    const raw = window.localStorage.getItem(DEV_SESSION_KEY);
+    return raw ? (JSON.parse(raw) as AuthUser) : null;
+  });
+
+  const setRole = (role: Role) => {
+    setUser((current) => {
+      if (!current) return current;
+      const next = { ...localUsers[role], orgId: current.orgId ?? 'org_demo' };
+      window.localStorage.setItem(DEV_SESSION_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const signIn = async ({ role, password, orgId }: LocalSignInPayload) => {
+    const expected = import.meta.env.VITE_LEDGER_DEV_PASSWORD ?? 'ledger-demo';
+    if (password !== expected) {
+      throw new Error('The local development password is incorrect.');
+    }
+    const nextUser = { ...localUsers[role], orgId: orgId || import.meta.env.VITE_LEDGER_DEV_ORG_ID || 'org_demo' };
+    window.localStorage.setItem(DEV_SESSION_KEY, JSON.stringify(nextUser));
+    setUser(nextUser);
+  };
+
+  const signOut = () => {
+    window.localStorage.removeItem(DEV_SESSION_KEY);
+    setUser(null);
+  };
 
   useEffect(() => {
-    registerAuthHeadersResolver(async () => ({
-      'X-Ledger-Dev-Role': role,
-      'X-Ledger-Dev-Org-Id': import.meta.env.VITE_LEDGER_DEV_ORG_ID ?? 'org_demo',
-      'X-Ledger-Dev-User-Id': user.id,
-      'X-Ledger-Dev-Internal': String(import.meta.env.VITE_LEDGER_DEV_INTERNAL === 'true' || user.isInternal),
-      'X-Ledger-Dev-Email': user.email,
-      'X-Ledger-Dev-Name': user.name,
-    }));
-  }, [role, user]);
+    registerAuthHeadersResolver(async () => {
+      if (!user) return {};
+      return {
+        'X-Ledger-Dev-Role': user.role,
+        'X-Ledger-Dev-Org-Id': user.orgId ?? 'org_demo',
+        'X-Ledger-Dev-User-Id': user.id,
+        'X-Ledger-Dev-Internal': String(Boolean(user.isInternal)),
+        'X-Ledger-Dev-Email': user.email,
+        'X-Ledger-Dev-Name': user.name,
+      };
+    });
+  }, [user]);
 
   return (
-    <AuthContext.Provider value={{ user, setRole }}>
+    <AuthContext.Provider value={{ user, setRole, signIn, signOut }}>
       {children}
     </AuthContext.Provider>
   );
@@ -106,12 +100,12 @@ const MockAuthProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
 
 const ClerkBridge: React.FC<React.PropsWithChildren> = ({ children }) => {
   const { user, isSignedIn } = useUser();
-  const { getToken, orgId } = useClerkAuth();
+  const { getToken, orgId, signOut } = useClerkAuth();
   const [overrideRole, setOverrideRole] = useState<Role | null>(null);
 
   const contextValue = useMemo<AuthContextValue>(() => {
     if (!isSignedIn || !user) {
-      return { user: null, setRole: () => {} };
+      return { user: null, setRole: () => {}, signOut };
     }
 
     const metaRole = user.publicMetadata?.role || user.unsafeMetadata?.role;
@@ -124,18 +118,19 @@ const ClerkBridge: React.FC<React.PropsWithChildren> = ({ children }) => {
         email: user.primaryEmailAddress?.emailAddress || 'unknown',
         role,
         orgId: orgId ?? null,
-        isInternal: role === 'admin' || role === 'security_officer' || role === 'auditor'
+        isInternal: role === 'admin' || role === 'security_officer' || role === 'auditor' || role === 'user_proxy',
       },
-      setRole: setOverrideRole
+      setRole: setOverrideRole,
+      signOut: () => {
+        void signOut();
+      },
     };
-  }, [isSignedIn, user, overrideRole, orgId]);
+  }, [isSignedIn, user, overrideRole, orgId, signOut]);
 
   useEffect(() => {
     registerAuthHeadersResolver(async () => {
       const token = await getToken();
-      return token
-        ? { Authorization: `Bearer ${token}` }
-        : {};
+      return token ? { Authorization: `Bearer ${token}` } : {};
     });
   }, [getToken]);
 
@@ -160,9 +155,9 @@ export const authProvider = (Wrapper: React.FC<React.PropsWithChildren>) => {
   if (!publishableKey) {
     return function AuthRoot({ children }: React.PropsWithChildren) {
       return (
-        <MockAuthProvider>
+        <DevAuthProvider>
           <Wrapper>{children}</Wrapper>
-        </MockAuthProvider>
+        </DevAuthProvider>
       );
     };
   }

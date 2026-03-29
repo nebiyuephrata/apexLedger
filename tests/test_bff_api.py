@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from ledger.api import server as api_server
 from ledger.api.infra import InMemoryInfraStore
+from ledger.api.policy import ApplicationAccessRecord
 
 
 class _DummyConn:
@@ -236,3 +237,77 @@ def test_applications_are_paginated(monkeypatch):
     assert payload["page_size"] == 2
     assert payload["total"] == 4
     assert len(payload["items"]) == 2
+
+
+def test_agent_interactions_surface_live_session_events(monkeypatch):
+    with make_client(monkeypatch) as client:
+        interaction_rows = [
+            {"stream_id": "agent-document_processing-sess-1", "event_type": "AgentNodeExecuted", "payload": {"node_name": "extract_income_statement", "duration_ms": 320}, "recorded_at": None, "global_position": 22},
+            {"stream_id": "agent-document_processing-sess-1", "event_type": "AgentToolCalled", "payload": {"tool_name": "registry_lookup", "tool_output_summary": "ok"}, "recorded_at": None, "global_position": 21},
+        ]
+
+        async def fake_fetchrow(pool, query, *args):
+            return {"applicant_id": "A-1", "tenant_id": "org_demo", "owner_user_id": "loan_officer-user"}
+
+        async def fake_fetch(pool, query, *args):
+            if "projection_agent_session_index" in query:
+                return [{"session_id": "sess-1", "agent_type": "document_processing"}]
+            return interaction_rows
+
+        monkeypatch.setattr(api_server, "_fetchrow", fake_fetchrow)
+        monkeypatch.setattr(api_server, "_fetch", fake_fetch)
+        response = client.get(
+            "/api/agents/interactions?application_id=loan-1&agent_type=document_processing&limit=5",
+            headers=auth_headers("loan_officer"),
+        )
+
+    payload = unwrap_ok(response)
+    assert len(payload) == 2
+    assert payload[0]["event_type"] == "AgentNodeExecuted"
+    assert "extract_income_statement" in payload[0]["summary"]
+
+
+def test_document_upload_persists_file_and_event(monkeypatch, tmp_path):
+    with make_client(monkeypatch) as client:
+        appended = {}
+
+        class FakeStore:
+            async def connect(self):
+                return None
+
+            async def stream_version(self, stream_id):
+                appended["stream_id"] = stream_id
+                return 2
+
+            async def append(self, stream_id, events, expected_version):
+                appended["events"] = events
+                appended["expected_version"] = expected_version
+                return [3]
+
+            async def close(self):
+                return None
+
+        async def fake_resolve(application_id):
+            return ApplicationAccessRecord(
+                application_id=application_id,
+                applicant_id="A-1",
+                tenant_id="org_demo",
+                owner_user_id="applicant-user",
+            )
+
+        monkeypatch.setattr(api_server, "_resolve_application_record", fake_resolve)
+        monkeypatch.setattr(api_server, "EventStore", lambda *args, **kwargs: FakeStore())
+        monkeypatch.setattr(api_server, "DOCUMENTS_DIR", tmp_path)
+
+        response = client.post(
+            "/api/uploads/documents",
+            headers=auth_headers("applicant", user_id="applicant-user"),
+            data={"application_id": "loan-1", "document_type": "income_statement", "fiscal_year": "2025"},
+            files={"file": ("income.pdf", b"pdf-bytes", "application/pdf")},
+        )
+
+    payload = unwrap_ok(response)
+    assert payload["application_id"] == "loan-1"
+    assert appended["stream_id"] == "loan-loan-1"
+    assert appended["events"][0]["event_type"] == "DocumentUploaded"
+    assert (tmp_path / "loan-1" / "income.pdf").exists()

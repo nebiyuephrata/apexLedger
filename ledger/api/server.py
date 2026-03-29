@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Sequence
 
 import asyncpg
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -29,8 +31,11 @@ from ledger.api.infra import (
     stable_fingerprint,
 )
 from ledger.api.policy import ApplicationAccessRecord, policy_engine
+from ledger.event_store import EventStore
 from ledger.mcp import resources as mcp_resources
 from ledger.mcp import tools as mcp_tools
+from ledger.schema.events import DocumentFormat, DocumentType, DocumentUploaded
+from ledger import upcasters
 
 DB_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:apex@localhost:55432/apex_ledger")
 IDEMPOTENCY_TTL_SECONDS = int(os.environ.get("IDEMPOTENCY_TTL_SECONDS", "86400"))
@@ -41,6 +46,7 @@ CACHE_TTL_HEALTH = int(os.environ.get("CACHE_TTL_HEALTH_SECONDS", "3"))
 CACHE_TTL_AUDIT = int(os.environ.get("CACHE_TTL_AUDIT_SECONDS", "10"))
 POOL_MIN_SIZE = int(os.environ.get("LEDGER_DB_POOL_MIN_SIZE", "1"))
 POOL_MAX_SIZE = int(os.environ.get("LEDGER_DB_POOL_MAX_SIZE", "8"))
+DOCUMENTS_DIR = Path(os.environ.get("DOCUMENTS_DIR", "./documents")).resolve()
 
 TOOL_DEFINITIONS: list[dict[str, str]] = [
     {
@@ -170,6 +176,42 @@ async def _resolve_application_record(application_id: str) -> ApplicationAccessR
         tenant_id=row.get("tenant_id"),
         owner_user_id=row.get("owner_user_id"),
     )
+
+
+def _parse_payload(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def _agent_interaction_summary(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type == "AgentNodeExecuted":
+        return f"Node {payload.get('node_name')} completed in {payload.get('duration_ms')}ms"
+    if event_type == "AgentToolCalled":
+        return f"Tool {payload.get('tool_name')} called · {payload.get('tool_output_summary') or 'completed'}"
+    if event_type == "AgentSessionStarted":
+        return f"Session opened for application {payload.get('application_id')}"
+    if event_type == "AgentSessionCompleted":
+        return f"Session completed after {payload.get('total_nodes_executed')} nodes"
+    if event_type == "AgentSessionFailed":
+        return f"Session failed: {payload.get('error_type')} · {payload.get('error_message')}"
+    if event_type == "AgentOutputWritten":
+        return f"Output written · {payload.get('output_summary') or payload.get('events_written')}"
+    return event_type
+
+
+def _detect_document_format(filename: str) -> DocumentFormat:
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        return DocumentFormat.XLSX
+    if suffix == ".csv":
+        return DocumentFormat.CSV
+    return DocumentFormat.PDF
 
 
 def _detail_payload(detail: Any, request_id: str, default_message: str, default_type: str = "ApiError") -> ApiError:
@@ -532,6 +574,73 @@ def create_app() -> FastAPI:
 
         return _ok(request, await get_cached_or_load(cache_key, CACHE_TTL_APPLICATIONS, _load))
 
+    @app.get("/api/agents/interactions")
+    async def agent_interactions(
+        request: Request,
+        application_id: str = Query(...),
+        agent_type: str | None = Query(default=None),
+        limit: int = Query(default=25, ge=1, le=100),
+        auth: AuthContext = Depends(resolve_auth_context),
+    ) -> JSONResponse:
+        policy_engine.ensure_view_allowed(auth, "dashboard")
+        summary_row = await _fetchrow(
+            request.app.state.db_pool,
+            "SELECT applicant_id, tenant_id, owner_user_id FROM projection_application_summary WHERE application_id=$1",
+            application_id,
+        )
+        if not summary_row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown application: {application_id}")
+        summary_data = dict(summary_row)
+        policy_engine.ensure_application_visible(
+            auth,
+            ApplicationAccessRecord(
+                application_id=application_id,
+                applicant_id=summary_data.get("applicant_id"),
+                tenant_id=summary_data.get("tenant_id"),
+                owner_user_id=summary_data.get("owner_user_id"),
+            ),
+        )
+        cache_key = _cache_scope(auth, f"agent-interactions:{application_id}:{agent_type or 'all'}:{limit}")
+
+        async def _load() -> list[dict[str, Any]]:
+            session_rows = await _fetch(
+                request.app.state.db_pool,
+                "SELECT session_id, agent_type FROM projection_agent_session_index WHERE application_id=$1 AND ($2::text IS NULL OR agent_type=$2)",
+                application_id,
+                agent_type,
+            )
+            stream_ids = [f"agent-{row['agent_type']}-{row['session_id']}" for row in session_rows]
+            if not stream_ids:
+                return []
+            rows = await _fetch(
+                request.app.state.db_pool,
+                "SELECT stream_id, event_type, payload, recorded_at, global_position FROM events WHERE stream_id = ANY($1::text[]) ORDER BY global_position DESC LIMIT $2",
+                stream_ids,
+                limit,
+            )
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                payload = _parse_payload(row["payload"])
+                stream_id = str(row["stream_id"])
+                session_id = stream_id.rsplit("-", 1)[-1]
+                agent_kind = stream_id.split("-", 2)[1] if stream_id.count("-") >= 2 else "unknown"
+                items.append(
+                    {
+                        "stream_id": stream_id,
+                        "session_id": session_id,
+                        "agent_type": agent_kind,
+                        "event_type": row["event_type"],
+                        "timestamp": row["recorded_at"].isoformat() if row["recorded_at"] else None,
+                        "node_name": payload.get("node_name"),
+                        "tool_name": payload.get("tool_name"),
+                        "summary": _agent_interaction_summary(row["event_type"], payload),
+                        "global_position": row["global_position"],
+                    }
+                )
+            return items
+
+        return _ok(request, await get_cached_or_load(cache_key, 2, _load))
+
     @app.get("/api/ledger/health")
     async def ledger_health(request: Request, auth: AuthContext = Depends(resolve_auth_context)) -> JSONResponse:
         cache_key = _cache_scope(auth, "ledger-health")
@@ -564,7 +673,7 @@ def create_app() -> FastAPI:
                     "level": "WARN" if int(outbox_pending or 0) else "INFO",
                     "component": "outbox",
                     "message": f"Pending outbox events: {int(outbox_pending or 0)}",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             ]
             logs.extend(
@@ -573,7 +682,7 @@ def create_app() -> FastAPI:
                     "level": "INFO",
                     "component": "projection-daemon",
                     "message": f"{checkpoint['projection_name']} advanced to position {checkpoint['last_position']}",
-                    "timestamp": checkpoint["updated_at"].isoformat() if checkpoint["updated_at"] else datetime.utcnow().isoformat(),
+                    "timestamp": checkpoint["updated_at"].isoformat() if checkpoint["updated_at"] else datetime.now(timezone.utc).isoformat(),
                 }
                 for checkpoint in checkpoints[:10]
             )
@@ -583,7 +692,7 @@ def create_app() -> FastAPI:
                     "level": "ERROR" if "Failed" in event["event_type"] else "INFO",
                     "component": event["stream_id"].split("-", 1)[0],
                     "message": f"{event['event_type']} on {event['stream_id']}",
-                    "timestamp": event["recorded_at"].isoformat() if event["recorded_at"] else datetime.utcnow().isoformat(),
+                    "timestamp": event["recorded_at"].isoformat() if event["recorded_at"] else datetime.now(timezone.utc).isoformat(),
                 }
                 for event in events
             )
@@ -602,6 +711,87 @@ def create_app() -> FastAPI:
     async def ops_runtime(request: Request, auth: AuthContext = Depends(resolve_auth_context)) -> JSONResponse:
         policy_engine.ensure_logs_allowed(auth)
         return _ok(request, runtime_snapshot())
+
+    @app.post("/api/uploads/documents")
+    async def upload_document(
+        request: Request,
+        application_id: str = Form(...),
+        document_type: str = Form(...),
+        fiscal_year: str | None = Form(default=None),
+        file: UploadFile = File(...),
+        auth: AuthContext = Depends(resolve_auth_context),
+    ) -> JSONResponse:
+        record = await _resolve_application_record(application_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown application: {application_id}")
+        policy_engine.ensure_application_visible(auth, record)
+        if auth.role not in {"applicant", "loan_officer", "admin", "user_proxy"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This role cannot upload documents")
+
+        try:
+            doc_type = DocumentType(str(document_type).lower())
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported document type: {document_type}") from exc
+
+        filename = file.filename or f"{application_id}-{document_type}"
+        file_bytes = await file.read()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        target_dir = DOCUMENTS_DIR / application_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / filename
+        target_path.write_bytes(file_bytes)
+
+        event = DocumentUploaded(
+            application_id=application_id,
+            document_id=f"doc-{uuid.uuid4().hex[:12]}",
+            document_type=doc_type,
+            document_format=_detect_document_format(filename),
+            filename=filename,
+            file_path=str(target_path),
+            file_size_bytes=len(file_bytes),
+            file_hash=file_hash,
+            fiscal_year=int(fiscal_year) if fiscal_year else None,
+            uploaded_at=datetime.now(timezone.utc),
+            uploaded_by=auth.user_id,
+        ).to_store_dict()
+
+        store = EventStore(DB_URL, upcaster_registry=upcasters.registry)
+        upcasters.registry.store = store
+        await store.connect()
+        try:
+            stream_id = f"loan-{application_id}"
+            version = await store.stream_version(stream_id)
+            await store.append(stream_id=stream_id, events=[event], expected_version=version)
+        finally:
+            await store.close()
+
+        await _invalidate_after_write(auth, application_id)
+        record_action(
+            {
+                "id": f"upload-{event['payload']['document_id']}",
+                "level": "INFO",
+                "component": "document-upload",
+                "message": f"{filename} uploaded for {application_id}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "actor": auth.role,
+                "org_id": auth.org_id,
+                "user_id": auth.user_id,
+                "request_id": request.state.request_id,
+                "result": "ok",
+            }
+        )
+        return _ok(
+            request,
+            {
+                "application_id": application_id,
+                "document_id": event["payload"]["document_id"],
+                "filename": filename,
+                "file_path": str(target_path),
+                "file_hash": file_hash,
+                "uploaded_at": event["payload"]["uploaded_at"],
+            },
+            status_code=status.HTTP_201_CREATED,
+        )
 
     @app.post("/api/tools/{tool_name}")
     async def invoke_tool(
@@ -707,7 +897,7 @@ def create_app() -> FastAPI:
                 "level": "INFO" if status_code < 400 else "ERROR",
                 "component": "browser-api",
                 "message": f"{tool_name} completed with status {status_code}",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "actor": auth.role,
                 "org_id": auth.org_id,
                 "user_id": auth.user_id,

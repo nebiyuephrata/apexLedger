@@ -100,6 +100,18 @@ export type AgentSessionStatus = {
   context_source: string;
 };
 
+export type AgentInteraction = {
+  stream_id: string;
+  session_id: string;
+  agent_type: string;
+  event_type: string;
+  timestamp: string | null;
+  node_name?: string | null;
+  tool_name?: string | null;
+  summary: string;
+  global_position?: number | null;
+};
+
 export type CommandDefinition = {
   name: string;
   description: string;
@@ -159,4 +171,13 @@ export type RuntimeSnapshot = {
   avg_db_latency_ms: number;
   routes: Record<string, { count: number; p50_ms: number; p95_ms: number; p99_ms: number }>;
   recent_actions: ActivityLog[];
+};
+
+export type DocumentUploadResult = {
+  application_id: string;
+  document_id: string;
+  filename: string;
+  file_path: string;
+  file_hash: string;
+  uploaded_at: string;
 };

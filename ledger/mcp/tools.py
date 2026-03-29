@@ -128,8 +128,12 @@ async def _with_store():
 def _default_agent_model(command: dict) -> str:
     if command.get("model_version"):
         return command["model_version"]
+    if os.environ.get("OPENROUTER_MODEL"):
+        return os.environ["OPENROUTER_MODEL"]
     if os.environ.get("GEMINI_MODEL"):
         return os.environ["GEMINI_MODEL"]
+    if os.environ.get("LLM_PROVIDER", "").lower() == "openrouter":
+        return "google/gemini-2.5-flash"
     if os.environ.get("LLM_PROVIDER", "").lower() == "gemini":
         return "gemini-1.5-pro"
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")

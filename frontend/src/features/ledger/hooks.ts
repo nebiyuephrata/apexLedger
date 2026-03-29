@@ -11,6 +11,7 @@ export const ledgerKeys = {
   commands: ['commands'] as const,
   actors: ['actors'] as const,
   sessions: (params?: { page?: number; pageSize?: number; agentType?: string }) => ['agent-sessions', params ?? {}] as const,
+  interactions: (params: { applicationId: string; agentType?: string; limit?: number }) => ['agent-interactions', params] as const,
   agentPerformance: (agentType?: string) => ['agent-performance', agentType ?? 'default'] as const,
   logs: (params?: { page?: number; pageSize?: number; level?: string; search?: string }) => ['logs', params ?? {}] as const,
   runtime: ['runtime'] as const,
@@ -84,6 +85,15 @@ export const useAgentSessionsQuery = (params?: { page?: number; pageSize?: numbe
     refetchInterval: 10_000,
   });
 
+export const useAgentInteractionsQuery = (params: { applicationId: string; agentType?: string; limit?: number }) =>
+  useQuery({
+    queryKey: ledgerKeys.interactions(params),
+    queryFn: () => ledgerClient.getAgentInteractions(params),
+    enabled: Boolean(params.applicationId),
+    staleTime: 2_000,
+    refetchInterval: 3_000,
+  });
+
 export const useAgentPerformanceQuery = (agentType?: string) =>
   useQuery({
     queryKey: ledgerKeys.agentPerformance(agentType),
@@ -118,8 +128,25 @@ export const useInvokeToolMutation = () => {
         queryClient.invalidateQueries({ queryKey: ['applications'] }),
         queryClient.invalidateQueries({ queryKey: ledgerKeys.health }),
         queryClient.invalidateQueries({ queryKey: ['agent-sessions'] }),
+        queryClient.invalidateQueries({ queryKey: ['agent-interactions'] }),
         queryClient.invalidateQueries({ queryKey: ['logs'] }),
         queryClient.invalidateQueries({ queryKey: ledgerKeys.runtime }),
+      ]);
+    },
+  });
+};
+
+export const useUploadDocumentMutation = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (payload: { applicationId: string; documentType: string; fiscalYear?: string; file: File }) =>
+      ledgerClient.uploadDocument(payload),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['applications'] }),
+        queryClient.invalidateQueries({ queryKey: ['logs'] }),
+        queryClient.invalidateQueries({ queryKey: ['agent-sessions'] }),
       ]);
     },
   });

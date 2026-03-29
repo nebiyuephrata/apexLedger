@@ -95,7 +95,7 @@ export const AppShell: React.FC<React.PropsWithChildren> = ({ children }) => {
           <Divider className="border-slate-800" />
           <div className="p-4">
             <Typography variant="caption" className="text-slate-400">
-              Role Switcher (Mock)
+              Role Switcher (Local Dev)
             </Typography>
             <div className="mt-2 flex flex-wrap gap-2">
               {(Object.keys(roleLabels) as Role[]).map((role) => (

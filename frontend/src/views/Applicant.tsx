@@ -1,8 +1,9 @@
 import React from 'react';
-import { Button, Chip, Typography } from '@mui/material';
+import { Button, Chip, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, TextField, Typography } from '@mui/material';
 import toast from 'react-hot-toast';
 import { SectionCard } from '../components/SectionCard';
-import { useApplicationsQuery } from '../features/ledger/hooks';
+import { useApplicationsQuery, useUploadDocumentMutation } from '../features/ledger/hooks';
+import { LedgerApiError } from '../lib/ledgerClient';
 
 const currency = new Intl.NumberFormat('en-US', {
   style: 'currency',
@@ -11,9 +12,47 @@ const currency = new Intl.NumberFormat('en-US', {
 });
 
 export const Applicant: React.FC = () => {
+  const [uploadOpen, setUploadOpen] = React.useState(false);
+  const [documentType, setDocumentType] = React.useState('income_statement');
+  const [fiscalYear, setFiscalYear] = React.useState('2025');
+  const [file, setFile] = React.useState<File | null>(null);
   const { data: applicationsPage } = useApplicationsQuery();
+  const uploadDocument = useUploadDocumentMutation();
   const applications = applicationsPage?.items ?? [];
   const application = applications[0] ?? null;
+
+  const submitUpload = () => {
+    if (!application) {
+      toast.error('Create or select an application first.');
+      return;
+    }
+    if (!file) {
+      toast.error('Choose a file to upload.');
+      return;
+    }
+    uploadDocument.mutate(
+      {
+        applicationId: application.application_id,
+        documentType,
+        fiscalYear,
+        file,
+      },
+      {
+        onSuccess: (result) => {
+          toast.success(`Uploaded ${result.filename}`);
+          setUploadOpen(false);
+          setFile(null);
+        },
+        onError: (error) => {
+          if (error instanceof LedgerApiError) {
+            toast.error(error.message);
+            return;
+          }
+          toast.error(error instanceof Error ? error.message : 'Upload failed.');
+        },
+      },
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -29,7 +68,7 @@ export const Applicant: React.FC = () => {
       <SectionCard
         title="Current Application"
         subtitle="Submission progress and document intake status."
-        actions={<Button variant="contained" onClick={() => toast.success('Document upload handoff queued')}>Upload Documents</Button>}
+        actions={<Button variant="contained" onClick={() => setUploadOpen(true)}>Upload Documents</Button>}
       >
         {application ? (
           <div className="space-y-4">
@@ -66,6 +105,46 @@ export const Applicant: React.FC = () => {
           </Typography>
         )}
       </SectionCard>
+
+      <Dialog open={uploadOpen} onClose={() => setUploadOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Upload Application Document</DialogTitle>
+        <DialogContent className="space-y-4">
+          <TextField
+            select
+            margin="dense"
+            label="Document Type"
+            fullWidth
+            value={documentType}
+            onChange={(event) => setDocumentType(event.target.value)}
+          >
+            <MenuItem value="income_statement">Income Statement</MenuItem>
+            <MenuItem value="balance_sheet">Balance Sheet</MenuItem>
+            <MenuItem value="cash_flow_statement">Cash Flow Statement</MenuItem>
+          </TextField>
+          <TextField
+            margin="dense"
+            label="Fiscal Year"
+            fullWidth
+            value={fiscalYear}
+            onChange={(event) => setFiscalYear(event.target.value)}
+          />
+          <Button component="label" variant="outlined">
+            {file ? file.name : 'Choose File'}
+            <input
+              hidden
+              type="file"
+              accept=".pdf,.xlsx,.xls,.csv"
+              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+            />
+          </Button>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setUploadOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={submitUpload} disabled={uploadDocument.isPending}>
+            Upload
+          </Button>
+        </DialogActions>
+      </Dialog>
     </div>
   );
 };
