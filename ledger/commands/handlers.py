@@ -50,6 +50,8 @@ async def handle_submit_application(store, command: Any) -> list[dict]:
     applicant_id = _get(command, "applicant_id")
     requested_amount_usd = _get(command, "requested_amount_usd")
     loan_purpose = _get(command, "loan_purpose")
+    tenant_id = _get(command, "tenant_id")
+    owner_user_id = _get(command, "owner_user_id")
     loan_term_months = _get(command, "loan_term_months", 36)
     submission_channel = _get(command, "submission_channel", "web")
     contact_email = _get(command, "contact_email", "unknown@example.com")
@@ -87,6 +89,8 @@ async def handle_submit_application(store, command: Any) -> list[dict]:
     submit_event = ApplicationSubmitted(
         application_id=app_id,
         applicant_id=applicant_id,
+        tenant_id=tenant_id,
+        owner_user_id=owner_user_id,
         requested_amount_usd=Decimal(str(requested_amount_usd)),
         loan_purpose=loan_purpose_enum,
         loan_term_months=int(loan_term_months),

@@ -57,6 +57,8 @@ class LoanApplicationAggregate:
     application_id: str
     state: ApplicationState = ApplicationState.NEW
     applicant_id: str | None = None
+    tenant_id: str | None = None
+    owner_user_id: str | None = None
     requested_amount_usd: float | None = None
     loan_purpose: str | None = None
     loan_term_months: int | None = None
@@ -160,6 +162,8 @@ class LoanApplicationAggregate:
     def _on_ApplicationSubmitted(self, p: dict) -> None:
         self.state = ApplicationState.SUBMITTED
         self.applicant_id = p.get("applicant_id")
+        self.tenant_id = p.get("tenant_id")
+        self.owner_user_id = p.get("owner_user_id")
         self.requested_amount_usd = float(p.get("requested_amount_usd")) if p.get("requested_amount_usd") is not None else None
         self.loan_purpose = p.get("loan_purpose")
         self.loan_term_months = p.get("loan_term_months")

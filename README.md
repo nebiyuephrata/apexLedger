@@ -10,6 +10,9 @@ pip install -r requirements.txt
 # 2. Start PostgreSQL (docker)
 docker run -d -e POSTGRES_PASSWORD=apex -e POSTGRES_DB=apex_ledger -p 5432:5432 postgres:16
 
+# Optional: start the full local infra (PostgreSQL + Redis)
+docker compose up -d postgres redis
+
 # 3. Set environment (the .env file is git-ignored)
 cp .env.example .env
 # Edit .env — add your DATABASE_URL and LLM provider settings
@@ -25,6 +28,14 @@ cp .env.example .env
 #   DOCUMENT_EXTRACTION_API_ENDPOINT=/ingest/file
 #   DOCUMENT_EXTRACTION_STRUCTURED_QUERY_ENDPOINT=/query/structured
 #   DOCUMENT_EXTRACTION_API_KEY=
+# Browser/BFF hardening:
+#   REDIS_URL=redis://localhost:56379/0
+#   LEDGER_ALLOW_DEV_AUTH=true
+#   IDEMPOTENCY_TTL_SECONDS=86400
+#   RATE_LIMIT_WINDOW_SECONDS=60
+#   RATE_LIMIT_DEFAULT_BUDGET=30
+#   CLERK_JWKS_URL=
+#   CLERK_JWT_ISSUER=
 
 # 4. Generate all data (companies + documents + seed events → DB)
 python datagen/generate_all.py --db-url postgresql://postgres:apex@localhost/apex_ledger
@@ -42,6 +53,7 @@ pytest tests/test_schema_and_generator.py -v
 - Aggregates: `ledger/domain/aggregates/` reconstruct state purely by replaying events.
 - Agents: `ledger/agents/` contains one file per agent plus shared base scaffolding.
 - Registry: `ledger/registry/client.py` is read-only access to the applicant registry.
+- Browser/BFF: `ledger/api/server.py` verifies auth, enforces actor policy, adds Redis-backed idempotency/caching/rate limits, and exposes `/api/...` routes for the frontend.
 
 ## Repository Map
 - `ledger/schema/events.py` Event catalogue and typed models.
@@ -87,3 +99,19 @@ pytest tests/test_narratives.py -v           # Phase 3
 pytest tests/test_projections.py -v          # Phase 4
 pytest tests/test_mcp.py -v                  # Phase 5
 ```
+
+## Browser API and Frontend
+Run the browser-safe backend-for-frontend:
+```bash
+python scripts/run_bff.py
+```
+
+Frontend environment:
+```bash
+cd frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+The frontend expects the BFF at `http://localhost:8010` by default and uses Clerk when `VITE_CLERK_PUBLISHABLE_KEY` is set. In local development, dev headers can be used through the built-in mock auth path.

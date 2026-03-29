@@ -207,6 +207,8 @@ class ApplicationSubmitted(BaseEvent):
     event_type: str = "ApplicationSubmitted"
     application_id: str
     applicant_id: str
+    tenant_id: str | None = None
+    owner_user_id: str | None = None
     requested_amount_usd: Decimal
     loan_purpose: LoanPurpose
     loan_term_months: int

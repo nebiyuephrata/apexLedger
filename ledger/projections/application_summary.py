@@ -18,6 +18,8 @@ class ApplicationSummaryProjection:
                 application_id TEXT PRIMARY KEY,
                 state TEXT,
                 applicant_id TEXT,
+                tenant_id TEXT,
+                owner_user_id TEXT,
                 requested_amount_usd NUMERIC(15,2),
                 approved_amount_usd NUMERIC(15,2),
                 risk_tier TEXT,
@@ -39,6 +41,8 @@ class ApplicationSummaryProjection:
         await conn.execute("ALTER TABLE projection_application_summary ADD COLUMN IF NOT EXISTS human_reviewer_id TEXT")
         await conn.execute("ALTER TABLE projection_application_summary ADD COLUMN IF NOT EXISTS final_decision_at TIMESTAMPTZ")
         await conn.execute("ALTER TABLE projection_application_summary ADD COLUMN IF NOT EXISTS last_event_type TEXT")
+        await conn.execute("ALTER TABLE projection_application_summary ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        await conn.execute("ALTER TABLE projection_application_summary ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
 
     def _event_time(self, event: dict) -> datetime:
         ts = event.get("recorded_at")
@@ -89,7 +93,7 @@ class ApplicationSummaryProjection:
             return
 
         row = await conn.fetchrow(
-            "SELECT application_id, state, applicant_id, requested_amount_usd, "
+            "SELECT application_id, state, applicant_id, tenant_id, owner_user_id, requested_amount_usd, "
             "approved_amount_usd, risk_tier, fraud_score, compliance_status, "
             "decision_recommendation, agent_sessions_completed, human_reviewer_id, "
             "final_decision_at, last_event_type, last_event_at "
@@ -100,6 +104,8 @@ class ApplicationSummaryProjection:
             "application_id": app_id,
             "state": None,
             "applicant_id": None,
+            "tenant_id": None,
+            "owner_user_id": None,
             "requested_amount_usd": None,
             "approved_amount_usd": None,
             "risk_tier": None,
@@ -123,6 +129,8 @@ class ApplicationSummaryProjection:
 
         if et == "ApplicationSubmitted":
             current["applicant_id"] = payload.get("applicant_id")
+            current["tenant_id"] = payload.get("tenant_id")
+            current["owner_user_id"] = payload.get("owner_user_id")
             current["requested_amount_usd"] = payload.get("requested_amount_usd")
         elif et == "CreditAnalysisCompleted":
             decision = payload.get("decision", {}) or {}
@@ -159,13 +167,15 @@ class ApplicationSummaryProjection:
             """
             INSERT INTO projection_application_summary (
                 application_id, state, applicant_id, requested_amount_usd,
-                approved_amount_usd, risk_tier, fraud_score, compliance_status,
+                tenant_id, owner_user_id, approved_amount_usd, risk_tier, fraud_score, compliance_status,
                 decision_recommendation, agent_sessions_completed, human_reviewer_id,
                 final_decision_at, last_event_type, last_event_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
             ON CONFLICT (application_id) DO UPDATE SET
                 state=EXCLUDED.state,
                 applicant_id=EXCLUDED.applicant_id,
+                tenant_id=EXCLUDED.tenant_id,
+                owner_user_id=EXCLUDED.owner_user_id,
                 requested_amount_usd=EXCLUDED.requested_amount_usd,
                 approved_amount_usd=EXCLUDED.approved_amount_usd,
                 risk_tier=EXCLUDED.risk_tier,
@@ -182,6 +192,8 @@ class ApplicationSummaryProjection:
             current["state"],
             current["applicant_id"],
             current["requested_amount_usd"],
+            current["tenant_id"],
+            current["owner_user_id"],
             current["approved_amount_usd"],
             current["risk_tier"],
             current["fraud_score"],
